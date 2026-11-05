@@ -1,10 +1,10 @@
  'use strict';
-const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // v0.7: keep existing saved records
-const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true}},sessions:'07:00,12:00,15:00,21:00',dStart:'06:30',drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},done:{}};
+const VERSION='0.8';
+const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
+const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true}},sessions:'07:00,12:00,15:00,21:00',dLeadHours:1,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},done:{}};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-let state=clone(DEFAULT);try{const s=JSON.parse(localStorage.getItem(KEY)||localStorage.getItem(OLD)||'null');if(s&&s.eyes)state={...state,eyes:{left:{...DEFAULT.eyes.left,...s.eyes.left},right:{...DEFAULT.eyes.right,...s.eyes.right}},done:s.done||{},drugSessions:{...DEFAULT.drugSessions,...s.drugSessions}};}catch{}
-// 이전 기록은 보존하지만 새로운 기본 시간표를 우선 적용한다.
-state.sessions=DEFAULT.sessions;state.dStart=DEFAULT.dStart;
+let state=clone(DEFAULT);try{const s=JSON.parse(localStorage.getItem(KEY)||localStorage.getItem(OLD)||'null');if(s&&s.eyes)state={...state,eyes:{left:{...DEFAULT.eyes.left,...s.eyes.left},right:{...DEFAULT.eyes.right,...s.eyes.right}},done:s.done||{},drugSessions:{...DEFAULT.drugSessions,...s.drugSessions},sessions:s.sessions||DEFAULT.sessions,dLeadHours:[1,2,3].includes(Number(s.dLeadHours))?Number(s.dLeadHours):1};}catch{}
+// v0.8부터 설정한 기본 시간을 보존합니다. 이전 버전 기록도 유지합니다.
 const save=()=>localStorage.setItem(KEY,JSON.stringify(state));save();
 let selected=dayOf(new Date()),tab='today';
 const eyeNames={left:'왼쪽 눈',right:'오른쪽 눈'},colors={A:'#eaf0ff',B:'#f1ebff',C:'#fff0e6',D:'#e3f5f0'};
@@ -12,18 +12,29 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 const fmt=d=>new Intl.DateTimeFormat('ko-KR',{month:'long',day:'numeric',weekday:'short'}).format(new Date(d+'T12:00:00'));
 const minutes=t=>{const [h,m]=t.split(':').map(Number);return h*60+m;};
 const timeOf=n=>`${pad(Math.floor(n/60))}:${pad(n%60)}`;
-function activeEye(day,eye,time){const c=state.eyes[eye];if(!c.enabled||day<c.start||day>c.visit.slice(0,10))return false;return day!==c.visit.slice(0,10)||time<c.visit.slice(11,16);}
+function activeEye(day,eye,time){
+ const c=state.eyes[eye];if(!c.enabled||day<c.start||day>c.visit.slice(0,10))return false;
+ return day!==c.visit.slice(0,10)||time<c.visit.slice(11,16);
+}
 function doses(day){
  const out=[],slots=state.sessions.split(',');
+ const isSurgeryDay=Object.values(state.eyes).some(c=>c.enabled&&day===c.visit.slice(0,10));
+ // 수술 당일의 해당 눈은 아침 06:30 회차만 표시, 다른 눈은 평소 일정 유지.
  for(let i=0;i<slots.length;i++)for(const [drug,offset] of [['A',0],['B',10],['C',20]]){
   if(!state.drugSessions[drug].includes(i))continue;
-  const time=timeOf(minutes(slots[i])+offset);
-  out.push({drug,time,eyes:Object.keys(eyeNames).filter(e=>activeEye(day,e,time)),slot:i,color:colors[drug]});
+  const normalTime=timeOf(minutes(slots[i])+offset);
+  const normalEyes=Object.keys(eyeNames).filter(e=>day!==state.eyes[e].visit.slice(0,10));
+  // 수술 당일 아침 회차는 06:30/06:40/06:50으로 고정
+  if(i===0){
+   const surgeryEyes=Object.keys(eyeNames).filter(e=>state.eyes[e].enabled&&day===state.eyes[e].visit.slice(0,10));
+   if(surgeryEyes.length)out.push({drug,time:timeOf(390+offset),eyes:surgeryEyes.filter(e=>activeEye(day,e,timeOf(390+offset))),slot:i,color:colors[drug],kind:'surgery'});
+  }
+  if(normalEyes.length||!isSurgeryDay)out.push({drug,time:normalTime,eyes:normalEyes.filter(e=>activeEye(day,e,normalTime)),slot:i,color:colors[drug],kind:'normal'});
  }
  for(const eye of Object.keys(eyeNames)){
   const c=state.eyes[eye];if(!c.enabled||day!==c.visit.slice(0,10))continue;
-  const end=minutes(c.visit.slice(11,16));
-  for(let n=minutes(state.dStart);n<end;n+=30)out.push({drug:'D',time:timeOf(n),eyes:[eye],slot:n,color:colors.D});
+  const visit=minutes(c.visit.slice(11,16)),start=Math.max(0,visit-state.dLeadHours*60);
+  for(let n=start;n<visit;n+=30)out.push({drug:'D',time:timeOf(n),eyes:[eye],slot:n,color:colors.D,kind:'surgery'});
  }
  return out.sort((a,b)=>a.time.localeCompare(b.time)||a.drug.localeCompare(b.drug));
 }
@@ -48,9 +59,9 @@ function today(){const items=doses(selected),cells=allCells(items),done=cells.fi
 function history(){const items=doses(selected),cells=allCells(items),done=cells.filter(({d,e})=>isDone(d,e)).length;
  return datebar()+status()+`<div class="card"><div class="section-title">날짜별 점안 기록</div><div class="stat">${done} / ${cells.length}회 완료</div><div class="note">좌안과 우안 기록은 각각 독립적으로 저장됩니다. 체크 수정은 ‘오늘’ 탭에서 가능합니다.</div></div>`+(items.length?checklist(items):'<div class="card empty">이 날짜에 표시할 안약 일정이 없습니다.</div>');
 }
-function settings(){return `<form id="settings-form"><div class="card"><div class="section-title">눈별 수술 일정</div>${Object.entries(eyeNames).map(([e,name])=>`<div class="eye-settings"><strong>${name}</strong><div class="field"><label><input type="checkbox" id="${e}-enabled" ${state.eyes[e].enabled?'checked':''}> 일정 사용</label></div><div class="field"><label for="${e}-start">A·B·C 점안 시작일</label><input type="date" id="${e}-start" value="${esc(state.eyes[e].start)}" required></div><div class="field"><label for="${e}-visit">수술 당일 내원 일시</label><input type="datetime-local" id="${e}-visit" value="${esc(state.eyes[e].visit)}" required></div></div>`).join('')}</div><div class="card"><div class="section-title">A·B·C 기본 시간 (고정)</div><div class="fixed-times">07:00 · 12:00 · 15:00 · 21:00</div><p class="note">A 기준 시각입니다. B는 10분 뒤, C는 20분 뒤입니다. C는 아침과 저녁(21시 회차)에만 표시됩니다.</p><div class="section-title">D 안약 · 수술 당일만</div><div class="fixed-times">06:30 시작 · 30분 간격</div><p class="note">각 눈의 수술 당일에만 표시하고, 설정한 내원 시각 이전까지만 기록 항목을 생성합니다.</p><div class="warn">중요: 병원 안내문에는 D 안약을 내원 1시간 전부터 사용한다고 적혀 있습니다. 오전 6:30부터의 일정은 요청하신 테스트 설정이며, 특히 오른쪽 눈(오전 11시 내원)은 병원에 시작 시각과 횟수를 확인한 뒤 실제 점안에 사용하세요. 이 앱은 알림이 없는 기록용입니다.</div><button type="submit" class="button">설정 저장</button></div></form>`;}
-function render(){document.querySelector('#title').textContent=tab==='today'?'오늘의 안약':tab==='history'?'점안 기록':'일정 설정';document.querySelector('#subtitle').textContent=tab==='settings'?'눈별 날짜와 수술 일정을 설정해요':'왼쪽·오른쪽 눈을 각각 체크해요';document.querySelector('#content').innerHTML=tab==='today'?today():tab==='history'?history():settings();document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
+function settings(){return `<form id="settings-form"><div class="card"><div class="section-title">눈별 수술 일정</div>${Object.entries(eyeNames).map(([e,name])=>`<div class="eye-settings"><strong>${name}</strong><div class="field"><label><input type="checkbox" id="${e}-enabled" ${state.eyes[e].enabled?'checked':''}> 일정 사용</label></div><div class="field"><label for="${e}-start">A·B·C 점안 시작일</label><input type="date" id="${e}-start" value="${esc(state.eyes[e].start)}" required></div><div class="field"><label for="${e}-visit">수술 당일 내원 일시</label><input type="datetime-local" id="${e}-visit" value="${esc(state.eyes[e].visit)}" required></div></div>`).join('')}</div><div class="card"><div class="section-title">A·B·C 기본 시간 (수정 가능)</div>${state.sessions.split(',').map((t,i)=>`<div class="field"><label for="session-${i}">${['아침','점심','오후','밤'][i]} A 시작 시각</label><input type="time" id="session-${i}" value="${esc(t)}" required></div>`).join('')}<p class="note">B는 A보다 10분 뒤, C는 A보다 20분 뒤입니다. C는 아침·밤 회차에만 표시됩니다. 수술 당일 해당 눈의 A·B·C는 아침 06:30·06:40·06:50만 표시됩니다.</p><div class="section-title">D 안약 · 수술 당일</div><div class="field"><label for="d-lead">내원 시각 몇 시간 전부터 표시할까요?</label><select id="d-lead"><option value="1" ${state.dLeadHours===1?'selected':''}>1시간 전 (안내문 기준)</option><option value="2" ${state.dLeadHours===2?'selected':''}>2시간 전 (확인 후 선택)</option><option value="3" ${state.dLeadHours===3?'selected':''}>3시간 전 (확인 후 선택)</option></select></div><p class="note">별도 시각 입력 없이 내원 시간에서 역산하여 30분 간격으로 표시합니다. 내원 시각 전까지만 생성됩니다.</p><div class="warn">병원 안내문에는 내원 1시간 전부터라고 적혀 있습니다. 2~3시간 전 설정은 병원에서 별도로 지시한 경우에만 사용하세요. 이 앱은 알림이 없는 기록용입니다.</div><button type="submit" class="button">설정 저장</button></div></form>`;}
+function render(){document.querySelector('#version').textContent='v'+VERSION;document.querySelector('#title').textContent=tab==='today'?'오늘의 안약':tab==='history'?'점안 기록':'일정 설정';document.querySelector('#subtitle').textContent=tab==='settings'?'눈별 날짜와 수술 일정을 설정해요':'왼쪽·오른쪽 눈을 각각 체크해요';document.querySelector('#content').innerHTML=tab==='today'?today():tab==='history'?history():settings();document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){tab=b.dataset.tab;render();return;}if(e.target.id==='go-today'){selected=dayOf(new Date());render();}});
 document.addEventListener('change',e=>{if(e.target.id==='day'){selected=e.target.value;render();}if(e.target.matches('input[data-index][data-eye]')){const d=doses(selected)[Number(e.target.dataset.index)],eye=e.target.dataset.eye;if(d&&eligible(d,eye)){state.done[doseKey(d,eye)]=e.target.checked;save();render();}}});
-document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();for(const eye of Object.keys(eyeNames))state.eyes[eye]={start:document.getElementById(eye+'-start').value,visit:document.getElementById(eye+'-visit').value,enabled:document.getElementById(eye+'-enabled').checked};save();alert('설정이 저장되었습니다.');render();});
+document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();for(const eye of Object.keys(eyeNames))state.eyes[eye]={start:document.getElementById(eye+'-start').value,visit:document.getElementById(eye+'-visit').value,enabled:document.getElementById(eye+'-enabled').checked};state.sessions=[0,1,2,3].map(i=>document.getElementById('session-'+i).value).join(',');state.dLeadHours=Number(document.getElementById('d-lead').value);save();alert('설정이 저장되었습니다.');render();});
 render();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
