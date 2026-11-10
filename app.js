@@ -1,7 +1,7 @@
  'use strict';
-const VERSION='1.4';
+const VERSION='1.5';
 const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
-const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{}};
+const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{}};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 let state=clone(DEFAULT);try{const s=JSON.parse(localStorage.getItem(KEY)||localStorage.getItem(OLD)||'null');if(s&&s.eyes)state={...state,eyes:{left:{...DEFAULT.eyes.left,...s.eyes.left},right:{...DEFAULT.eyes.right,...s.eyes.right}},done:s.done||{},drugSessions:{...DEFAULT.drugSessions,...s.drugSessions},sessions:s.sessions||DEFAULT.sessions,dLeadHours:[1,2,3].includes(Number(s.dLeadHours))?Number(s.dLeadHours):1,gap:Number.isInteger(Number(s.gap??s.dry?.gap))&&Number(s.gap??s.dry?.gap)>=5&&Number(s.gap??s.dry?.gap)<=10?Number(s.gap??s.dry?.gap):10,dry:{...DEFAULT.dry,...s.dry}};}catch{}
 if(state.sessions==='07:00,12:00,15:00,21:00')state.sessions='07:00,12:00,17:00,21:00';
@@ -14,57 +14,92 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 const fmt=d=>new Intl.DateTimeFormat('ko-KR',{month:'long',day:'numeric',weekday:'short'}).format(new Date(d+'T12:00:00'));
 const minutes=t=>{const [h,m]=t.split(':').map(Number);return h*60+m;};
 const timeOf=n=>`${pad(Math.floor(n/60))}:${pad(n%60)}`;
+function completedMoment(eye){const c=state.eyes[eye];return c.completed&&c.completedAt?c.completedAt:null;}
 function activeEye(day,eye,time){
- const c=state.eyes[eye];if(!c.enabled||day<c.start||day>c.visit.slice(0,10))return false;
+ const c=state.eyes[eye];if(!c.enabled||day<c.start)return false;
+ const when=day+'T'+time,completed=completedMoment(eye);
+ if(completed&&when>=completed)return false;
+ if(day>c.visit.slice(0,10))return false;
  return day!==c.visit.slice(0,10)||time<c.visit.slice(11,16);
+}
+function addDose(out,drug,n,eye,slot,kind){
+ if(n<0||n>=1440)return;
+ const time=timeOf(n);
+ let dose=out.find(d=>d.drug===drug&&d.time===time&&d.slot===slot);
+ if(!dose){dose={drug,time,eyes:[],slot,color:colors[drug],kind};out.push(dose);}
+ if(!dose.eyes.includes(eye))dose.eyes.push(eye);
 }
 function doses(day){
  const out=[],slots=state.sessions.split(','),eyes=Object.keys(eyeNames),gap=state.gap;
- // 수술할 눈의 아침 A/B/C가 D 점안 구간과 겹치면 아침 회차를 이동합니다.
- // 같은 날 다른 눈도 점안 대상이면 동일한 아침 회차를 사용합니다.
+ // 병원 내원일: 수술 전 A/B/C가 D 시간대와 겹치면 두 눈의 아침 회차를 맞춥니다.
  let sharedMorning=minutes(slots[0]);
  for(const eye of eyes){
-  const c=state.eyes[eye];
-  if(!c.enabled||day!==c.visit.slice(0,10)||day<c.start)continue;
-  const visit=minutes(c.visit.slice(11,16));
-  const dStart=Math.max(0,visit-60),dEnd=Math.min(1439,visit+180);
-  const morningTimes=['A','B','C'].filter(drug=>state.drugSessions[drug].includes(0))
-   .map(drug=>minutes(slots[0])+({A:0,B:gap,C:2*gap}[drug]));
-  if(morningTimes.some(n=>n>=dStart&&n<=dEnd)){
-   sharedMorning=Math.min(sharedMorning,Math.max(0,dStart-30));
-  }
+  const c=state.eyes[eye];if(!c.enabled||day!==c.visit.slice(0,10)||day<c.start)continue;
+  const visit=minutes(c.visit.slice(11,16)),dStart=Math.max(0,visit-60),dEnd=Math.min(1439,visit+180);
+  const morning=['A','B','C'].filter(drug=>state.drugSessions[drug].includes(0)).map(drug=>minutes(slots[0])+({A:0,B:gap,C:2*gap}[drug]));
+  if(morning.some(n=>n>=dStart&&n<=dEnd))sharedMorning=Math.min(sharedMorning,Math.max(0,dStart-30));
  }
  for(const eye of eyes){
-  const c=state.eyes[eye];
-  if(!c.enabled)continue;
-  const surgery=day===c.visit.slice(0,10);
-  const visit=minutes(c.visit.slice(11,16));
-  const dStart=Math.max(0,visit-60),dEnd=Math.min(1439,visit+180);
-  for(let i=0;i<slots.length;i++){
-   if(surgery&&i!==0)continue;
-   for(const [drug,offset] of [['A',0],['B',gap],['C',2*gap]]){
-    if(!state.drugSessions[drug].includes(i))continue;
-    const n=(i===0?sharedMorning:minutes(slots[i]))+offset;
-    if(n<0||n>=1440)continue;
-    const time=timeOf(n);
-    if(!activeEye(day,eye,time))continue;
-    // 수술하는 눈과 다른 눈이 같은 시간에 점안하면 하나의 행으로 묶습니다.
-    let dose=out.find(d=>d.drug===drug&&d.time===time&&d.slot===i);
-    if(!dose){dose={drug,time,eyes:[],slot:i,color:colors[drug],kind:surgery?'surgery':'normal'};out.push(dose);}
-    if(!dose.eyes.includes(eye))dose.eyes.push(eye);
+  const c=state.eyes[eye];if(!c.enabled)continue;
+  const surgDay=c.visit.slice(0,10),surgery=day===surgDay,completed=completedMoment(eye);
+  const postDay=completed?.slice(0,10),postActive=!!completed&&day>=postDay;
+  // 수술 전 A/B/C: 완료 전까지 기존 규칙 유지.
+  if(day>=c.start && day<=surgDay){
+   for(let i=0;i<slots.length;i++){
+    if(surgery&&i!==0)continue;
+    for(const [drug,offset] of [['A',0],['B',gap],['C',2*gap]]){
+     if(!state.drugSessions[drug].includes(i))continue;
+     const n=(i===0?sharedMorning:minutes(slots[i]))+offset,time=timeOf(n);
+     if(n<0||n>=1440||!activeEye(day,eye,time))continue;
+     addDose(out,drug,n,eye,i,surgery?'surgery':'normal');
+    }
    }
   }
   if(surgery){
-   for(let n=dStart;n<=dEnd;n+=30)out.push({drug:'D',time:timeOf(n),eyes:[eye],slot:n,color:colors.D,kind:'surgery'});
+   const visit=minutes(c.visit.slice(11,16)),dStart=Math.max(0,visit-60),dEnd=Math.min(1439,visit+180);
+   for(let n=dStart;n<=dEnd;n+=30){
+    // 완료 체크된 눈은 완료 시각 이후 D를 더 이상 표시하지 않습니다.
+    if(completed&&day+'T'+timeOf(n)>=completed)continue;
+    addDose(out,'D',n,eye,n,'surgery');
+   }
+  }
+  if(postActive){
+   // 수술 당일 첫 점안 재개 시각부터, 전환 시각까지 1시간 간격.
+   // 전환 시각이 지난 후에는 마지막 점안 기준 2시간 간격.
+   // 다음 날부터는 A 아침 시각에서 취침 시각까지 2시간 간격.
+   const isFirst=day===postDay;
+   let starts=[];
+   if(isFirst){
+    const restart=minutes(c.restart),cutoff=minutes(c.hourlyUntil);
+    if(Number.isFinite(restart)){
+     let last=-1;
+     for(let n=restart;n<=Math.min(cutoff,1439);n+=60){starts.push(n);last=n;}
+     if(last<0){last=restart;starts.push(restart);}
+     for(let n=last+120;n<=minutes(slots[3]);n+=120)starts.push(n);
+    }
+   }else{
+    for(let n=minutes(slots[0]);n<=minutes(slots[3]);n+=120)starts.push(n);
+   }
+   for(const n of starts){
+    // 수술 후 A/B의 각 회차는 두 눈에 독립적으로 나타납니다.
+    addDose(out,'A',n,eye,'post-'+n,'post');
+    addDose(out,'B',n+gap,eye,'post-'+n,'post');
+   }
+   // 브로낙은 하루 두 번, 수술 당일에는 재개 시각 이후의 회차만 표시.
+   for(const i of state.drugSessions.C){
+    const n=minutes(slots[i])+2*gap;
+    if(isFirst&&(day+'T'+timeOf(n)<completed||n<minutes(c.restart)))continue;
+    addDose(out,'C',n,eye,'post-c-'+i,'post');
+   }
   }
  }
- // 디쿠아스는 각 눈의 수술 전날까지만 표시합니다. 수술 당일 이후는 일정에 넣지 않습니다.
- if(state.dry.enabled && day>=state.dry.start){
+ // 디쿠아스는 수술 당일부터 해당 눈에서 제외, 다른 눈은 예정대로 유지.
+ if(state.dry.enabled&&day>=state.dry.start){
   for(let i=0;i<state.dry.times.length;i++){
    const time=state.dry.times[i];
    if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(time))continue;
    const eligibleEyes=eyes.filter(eye=>state.eyes[eye].enabled&&day<state.eyes[eye].visit.slice(0,10));
-   if(eligibleEyes.length)out.push({drug:'E',time,eyes:eligibleEyes,slot:i,color:colors.E,kind:'dry'});
+   for(const eye of eligibleEyes)addDose(out,'E',minutes(time),eye,i,'dry');
   }
  }
  return out.sort((a,b)=>a.time.localeCompare(b.time)||a.drug.localeCompare(b.drug));
@@ -74,7 +109,7 @@ const isDone=(d,e)=>!!state.done[doseKey(d,e)];
 const eligible=(d,e)=>d.eyes.includes(e);
 const allCells=items=>items.flatMap(d=>Object.keys(eyeNames).filter(e=>eligible(d,e)).map(e=>({d,e})));
 function datebar(){return `<div class="card datebar"><div><div class="muted">선택한 날짜</div><strong>${esc(fmt(selected))}</strong></div><input aria-label="기록 날짜" type="date" id="day" value="${esc(selected)}"><button class="pill" id="go-today" style="border:0">오늘</button></div>`;}
-function status(){return `<div class="card"><div class="section-title">수술 전 안약 사용 상태</div>${Object.entries(eyeNames).map(([eye,name])=>{const c=state.eyes[eye],on=c.enabled&&selected>=c.start&&selected<=c.visit.slice(0,10);return `<div class="historyrow"><span>${name}</span><strong class="${on?'on':'off'}">${!c.enabled?'사용 안 함':selected<c.start?'시작 전 · 비활성':selected>c.visit.slice(0,10)?'수술 후 · 비활성':'수술 전 · 시간별 적용'}</strong></div>`}).join('')}</div>`;}
+function status(){return `<div class="card"><div class="section-title">눈별 점안 단계</div>${Object.entries(eyeNames).map(([eye,name])=>{const c=state.eyes[eye],completed=completedMoment(eye),post=completed&&selected>=completed.slice(0,10);const on=c.enabled&&selected>=c.start;const label=!c.enabled?'일정 사용 안 함':!on?'시작 전':post?'수술 후 점안':selected>c.visit.slice(0,10)?'수술 후 설정 필요':selected===c.visit.slice(0,10)?'수술 당일':'수술 전 점안';return `<div class="historyrow"><span>${name}</span><strong class="${on?'on':'off'}">${label}</strong></div>`}).join('')}</div>`;}
 function checklist(items){let last='';return items.map((d,i)=>{
  let header='';if(last!==d.time){last=d.time;header=`<div class="timehead">${d.time}</div>`;}
  const boxes=Object.entries(eyeNames).map(([e,name])=>{
@@ -113,13 +148,23 @@ function history(){
  const grouped=Object.entries(items.reduce((acc,d)=>{(acc[d.drug]??=[]).push(d);return acc;},{})).map(([drug,ds])=>`<div class="card"><div class="history-group"><span class="letter" style="background:${colors[drug]}">${drug}</span><strong>${drugNames[drug]}</strong></div><div class="history-columns"><span>시간</span><span>왼쪽</span><span>오른쪽</span></div>${ds.map(d=>`<div class="history-line"><span>${d.time}</span>${Object.keys(eyeNames).map(e=>!eligible(d,e)?'<span class="history-na">—</span>':isDone(d,e)?'<span class="history-yes" aria-label="완료">✓ 완료</span>':'<span class="history-no">미완료</span>').join('')}</div>`).join('')}</div>`).join('');
  return `<div class="history-intro">날짜별 기록 보기 <span>읽기 전용</span></div>`+datebar()+`<div class="card"><div class="section-title">점안 기록 요약</div><div class="stat">${done} / ${cells.length}회</div><div class="note">지난 기록은 이 화면에서 변경할 수 없습니다. 수정이 필요하면 ‘오늘’ 탭에서 해당 날짜를 선택하세요.</div><div class="history-eyes">${eyeSummary}</div></div>`+(items.length?grouped:'<div class="card empty">이 날짜에 표시할 안약 일정이 없습니다.</div>');
 }
-function settings(){return `<form id="settings-form"><div class="card"><div class="section-title">눈별 수술 일정</div>${Object.entries(eyeNames).map(([e,name])=>`<div class="eye-settings"><strong>${name}</strong><div class="field"><label><input type="checkbox" id="${e}-enabled" ${state.eyes[e].enabled?'checked':''}> 일정 사용</label></div><div class="field"><label for="${e}-start">A·B·C 점안 시작일</label><input type="date" id="${e}-start" value="${esc(state.eyes[e].start)}" required></div><div class="field"><label for="${e}-visit">수술 당일 내원 일시</label><input type="datetime-local" id="${e}-visit" value="${esc(state.eyes[e].visit)}" required></div></div>`).join('')}</div><div class="card"><div class="section-title">A·B·C 기본 시간 (수정 가능)</div>${state.sessions.split(',').map((t,i)=>`<div class="field"><label for="session-${i}">${['아침','점심','오후','밤'][i]} A 시작 시각</label><input type="time" id="session-${i}" value="${esc(t)}" required></div>`).join('')}<p class="note">B는 A보다 설정 간격 뒤, C는 A보다 설정 간격의 두 배 뒤입니다. C는 아침·밤 회차에만 표시됩니다. 수술 당일 해당 눈은 아침 회차만 표시합니다. 한쪽 눈의 아침 A·B·C가 D 점안 시간대와 겹치면 A를 D 첫 점안 30분 전으로 이동하고 B·C는 설정 간격에 따라 배치됩니다. 같은 날 다른 눈도 점안 대상이라면 아침 시간을 함께 맞추며, 체크 기록은 눈별로 따로 저장합니다. 겹치지 않으면 설정한 아침 시간을 그대로 사용합니다.</p><div class="section-title">전체 안약의 최소 점안 간격</div><div class="field"><label for="global-gap">A·B·C 및 디쿠아스 공통 간격 (5~10분, 숫자 입력)</label><input type="number" id="global-gap" min="5" max="10" step="1" value="${state.gap}" required></div><p class="note">기본 10분. A→B→C 시각 계산에도 적용됩니다. 디쿠아스와 다른 안약 시간이 겹치면 별도의 충돌 목록을 표시하므로 직접 시간을 조정하세요. D의 시간은 바꾸지 않습니다.</p><div class="section-title">디쿠아스에스 · 하루 6회</div><div class="field"><label><input type="checkbox" id="dry-enabled" ${state.dry.enabled?'checked':''}> 디쿠아스 일정 사용</label></div><div class="field"><label for="dry-start">상담일 / 점안 시작일</label><input type="date" id="dry-start" value="${esc(state.dry.start)}" required></div>${state.dry.times.map((t,i)=>`<div class="field"><label for="dry-${i}">${i+1}회 점안 시각</label><input type="time" id="dry-${i}" value="${esc(t)}" required></div>`).join('')}<p class="note">디쿠아스는 2026년 10월 14일부터 각 눈의 수술 전날까지만 표시됩니다. 수술 당일에는 해당 눈의 디쿠아스 일정을 표시하지 않습니다. 두 눈의 완료 기록은 별도로 저장됩니다. 다른 약과 설정한 간격보다 가까우면 경고를 표시하며, 처방 시간은 임의로 자동 변경하지 않습니다. 수술 당일 실제 점안 여부는 병원 지침을 확인하세요.</p><div class="section-title">D 안약 · 수술 당일</div><p class="note">내원 시각 기준 1시간 전부터 3시간 후까지 30분 간격으로 자동 표시합니다. D 시각은 A·B·C의 자동 조정과 무관하게 유지됩니다. 별도 시간 설정은 없습니다.</p><div class="warn">병원 안내문에는 내원 1시간 전부터 수술 전까지라고 적혀 있습니다. 내원 3시간 후까지의 점안은 안내문과 다르므로 반드시 병원에 확인한 뒤 사용하세요. 이 앱은 알림이 없는 기록용입니다.</div><p class="note">시간을 수정한 후 저장하면 선택한 날짜의 충돌 여부를 다시 계산합니다. 충돌 목록은 ‘오늘’ 탭에서 날짜를 선택해 확인할 수 있습니다.</p><button type="submit" class="button">설정 저장</button></div></form>`;}
+function settings(){return `<form id="settings-form"><div class="card"><div class="section-title">눈별 수술 일정 및 완료 설정</div>${Object.entries(eyeNames).map(([e,name])=>`<div class="eye-settings"><strong>${name}</strong><div class="field"><label><input type="checkbox" id="${e}-enabled" ${state.eyes[e].enabled?'checked':''}> 일정 사용</label></div><div class="field"><label for="${e}-start">A·B·C 점안 시작일</label><input type="date" id="${e}-start" value="${esc(state.eyes[e].start)}" required></div><div class="field"><label for="${e}-visit">수술 당일 내원 일시</label><input type="datetime-local" id="${e}-visit" value="${esc(state.eyes[e].visit)}" required></div><div class="field"><label><input type="checkbox" id="${e}-completed" ${state.eyes[e].completed?'checked':''}> 수술 완료</label></div><div class="field"><label for="${e}-completedAt">수술 완료 날짜·시간</label><input type="datetime-local" id="${e}-completedAt" value="${esc(state.eyes[e].completedAt)}" required></div><div class="field"><label for="${e}-restart">수술 후 첫 점안 시작 시간</label><input type="time" id="${e}-restart" value="${esc(state.eyes[e].restart)}" required></div><div class="field"><label for="${e}-hourlyUntil">1시간 간격 종료 기준 (기본 18:00)</label><input type="time" id="${e}-hourlyUntil" value="${esc(state.eyes[e].hourlyUntil)}" required></div><p class="note">완료 체크를 하면 해당 눈의 완료 시각부터 D는 중지되고, 지정한 첫 점안 시각부터 수술 후 A·B 일정을 시작합니다. 수술 당일 기준 시각까지 1시간 간격, 이후 2시간 간격이며 다음 날부터는 아침~취침 전 2시간 간격입니다. C는 하루 두 번입니다. 완료·재개 시각은 병원에서 안내받은 실제 시각으로 입력하세요.</p></div>`).join('')}</div><div class="card"><div class="section-title">A·B·C 기본 시간 (수정 가능)</div>${state.sessions.split(',').map((t,i)=>`<div class="field"><label for="session-${i}">${['아침','점심','오후','밤'][i]} A 시작 시각</label><input type="time" id="session-${i}" value="${esc(t)}" required></div>`).join('')}<p class="note">수술 전 A→B→C는 설정한 간격을 따릅니다. C는 아침·밤에만 표시합니다. 한 눈의 수술 전 아침 회차가 D와 겹치면 양쪽 눈의 아침 시간을 함께 맞춥니다. 수술 후 A·B는 위 수술 후 간격에 따라, C는 하루 두 번 표시됩니다.</p><div class="section-title">전체 안약의 최소 점안 간격</div><div class="field"><label for="global-gap">안약 간 간격 (5~10분, 숫자 입력)</label><input type="number" id="global-gap" min="5" max="10" step="1" value="${state.gap}" required></div><p class="note">기본 10분. A·B 및 C의 시각 계산에 적용됩니다. 다른 안약과 겹치면 충돌을 알려주며 자동으로 옮기지 않습니다.</p><div class="section-title">디쿠아스에스 · 하루 6회</div><div class="field"><label><input type="checkbox" id="dry-enabled" ${state.dry.enabled?'checked':''}> 디쿠아스 일정 사용</label></div><div class="field"><label for="dry-start">상담일 / 점안 시작일</label><input type="date" id="dry-start" value="${esc(state.dry.start)}" required></div>${state.dry.times.map((t,i)=>`<div class="field"><label for="dry-${i}">${i+1}회 점안 시각</label><input type="time" id="dry-${i}" value="${esc(t)}" required></div>`).join('')}<p class="note">각 눈 수술 전날까지만 표시합니다. 기록 화면에 표시하지 않는다는 뜻이며 실제 점안 중단 지시는 아닙니다.</p><div class="section-title">D 미드린피 · 수술 당일</div><p class="note">기존 앱의 D 일정(내원 1시간 전~3시간 후, 30분 간격)을 유지하되, 수술 완료를 체크하면 해당 눈의 완료 시각부터 D를 중지합니다.</p><div class="warn">안내문에는 D를 수술 전까지 점안하라고 적혀 있습니다. 수술 후 D 사용 여부와 A·B 재개 시점은 반드시 병원 지침에 따르세요. 앱은 점안 알림이 없는 기록용입니다.</div><p class="note">설정을 변경하면 오늘·기록 화면에서 선택한 날짜의 스케줄을 다시 계산합니다.</p><button type="submit" class="button">설정 저장</button></div></form>`;}
 function render(){document.querySelector('#version').textContent='v'+VERSION;document.querySelector('#title').textContent=tab==='today'?'오늘의 안약':tab==='history'?'점안 기록':'일정 설정';document.querySelector('#subtitle').textContent=tab==='settings'?'눈별 날짜와 수술 일정을 설정해요':'왼쪽·오른쪽 눈을 각각 체크해요';document.querySelector('#content').innerHTML=tab==='today'?today():tab==='history'?history():settings();document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){tab=b.dataset.tab;render();return;}if(e.target.id==='go-today'){selected=dayOf(new Date());render();}});
 document.addEventListener('change',e=>{if(e.target.id==='day'){selected=e.target.value;render();}if(e.target.matches('input[data-index][data-eye]')){const d=doses(selected)[Number(e.target.dataset.index)],eye=e.target.dataset.eye;if(d&&eligible(d,eye)){state.done[doseKey(d,eye)]=e.target.checked;save();render();}}});
-document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();for(const eye of Object.keys(eyeNames))state.eyes[eye]={start:document.getElementById(eye+'-start').value,visit:document.getElementById(eye+'-visit').value,enabled:document.getElementById(eye+'-enabled').checked};state.sessions=[0,1,2,3].map(i=>document.getElementById('session-'+i).value).join(',');
+document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();
+ const nextEyes={};for(const eye of Object.keys(eyeNames)){
+  const get=id=>document.getElementById(eye+'-'+id);
+  nextEyes[eye]={start:get('start').value,visit:get('visit').value,enabled:get('enabled').checked,completed:get('completed').checked,completedAt:get('completedAt').value,restart:get('restart').value,hourlyUntil:get('hourlyUntil').value};
+  if(nextEyes[eye].completed){
+   const c=nextEyes[eye];
+   if(c.completedAt.slice(0,10)<c.visit.slice(0,10)){alert('수술 완료 날짜가 내원 날짜보다 빠릅니다. '+eyeNames[eye]+' 날짜를 확인해 주세요.');return;}
+   if(c.completedAt.slice(0,10)+'T'+c.restart<c.completedAt){alert(eyeNames[eye]+' 수술 후 첫 점안은 수술 완료 이후의 시각으로 입력해 주세요.');return;}
+  }
+ }
  const gap=Number(document.getElementById('global-gap').value);
  if(!Number.isInteger(gap)||gap<5||gap>10){alert('최소 점안 간격은 5~10 사이의 정수를 입력해 주세요.');return;}
- state.gap=gap;state.dry={enabled:document.getElementById('dry-enabled').checked,start:document.getElementById('dry-start').value,times:[0,1,2,3,4,5].map(i=>document.getElementById('dry-'+i).value),gap};
+ state.eyes=nextEyes;state.sessions=[0,1,2,3].map(i=>document.getElementById('session-'+i).value).join(',');state.gap=gap;
+ state.dry={enabled:document.getElementById('dry-enabled').checked,start:document.getElementById('dry-start').value,times:[0,1,2,3,4,5].map(i=>document.getElementById('dry-'+i).value),gap};
  save();alert('설정이 저장되었습니다.');render();});
 render();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
