@@ -1,5 +1,5 @@
  'use strict';
-const VERSION='1.5';
+const VERSION='1.6';
 const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
 const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{}};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
@@ -25,9 +25,11 @@ function activeEye(day,eye,time){
 function addDose(out,drug,n,eye,slot,kind){
  if(n<0||n>=1440)return;
  const time=timeOf(n);
- let dose=out.find(d=>d.drug===drug&&d.time===time&&d.slot===slot);
- if(!dose){dose={drug,time,eyes:[],slot,color:colors[drug],kind};out.push(dose);}
+ // 표시 행은 안약+시각으로 합치되, 눈별 기록 식별자는 각자 보존합니다.
+ let dose=out.find(d=>d.drug===drug&&d.time===time);
+ if(!dose){dose={drug,time,eyes:[],slot,eyeSlots:{},color:colors[drug],kind};out.push(dose);}
  if(!dose.eyes.includes(eye))dose.eyes.push(eye);
+ dose.eyeSlots[eye]=slot;
 }
 function doses(day){
  const out=[],slots=state.sessions.split(','),eyes=Object.keys(eyeNames),gap=state.gap;
@@ -104,7 +106,7 @@ function doses(day){
  }
  return out.sort((a,b)=>a.time.localeCompare(b.time)||a.drug.localeCompare(b.drug));
 }
-const doseKey=(d,eye)=>`${selected}|${eye}|${d.drug}|${d.drug==='D'?(minutes(state.eyes[eye].visit.slice(11,16))-d.slot):d.slot}`;
+const doseKey=(d,eye)=>{const slot=d.eyeSlots?.[eye]??d.slot;return `${selected}|${eye}|${d.drug}|${d.drug==='D'?(minutes(state.eyes[eye].visit.slice(11,16))-slot):slot}`;};
 const isDone=(d,e)=>!!state.done[doseKey(d,e)];
 const eligible=(d,e)=>d.eyes.includes(e);
 const allCells=items=>items.flatMap(d=>Object.keys(eyeNames).filter(e=>eligible(d,e)).map(e=>({d,e})));
