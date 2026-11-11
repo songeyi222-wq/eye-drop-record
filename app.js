@@ -1,9 +1,9 @@
  'use strict';
-const VERSION='2.3';
+const VERSION='2.4';
 const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
-const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',endDates:{left:'2026-11-11',right:'2026-11-11'},times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{},catalog:null,revisions:[],scheduleSchema:0};
+const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',endDates:{left:'2026-11-11',right:'2026-11-11'},times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{},catalog:null,revisions:[],scheduleSchema:0,remoteSchedule:null};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-let state=clone(DEFAULT);try{const s=JSON.parse(localStorage.getItem(KEY)||localStorage.getItem(OLD)||'null');if(s&&s.eyes)state={...state,eyes:{left:{...DEFAULT.eyes.left,...s.eyes.left},right:{...DEFAULT.eyes.right,...s.eyes.right}},done:s.done||{},drugSessions:{...DEFAULT.drugSessions,...s.drugSessions},sessions:s.sessions||DEFAULT.sessions,dLeadHours:[1,2,3].includes(Number(s.dLeadHours))?Number(s.dLeadHours):1,gap:Number.isInteger(Number(s.gap??s.dry?.gap))&&Number(s.gap??s.dry?.gap)>=5&&Number(s.gap??s.dry?.gap)<=10?Number(s.gap??s.dry?.gap):10,dry:{...DEFAULT.dry,...s.dry,endDates:{...DEFAULT.dry.endDates,...(s.dry?.endDates||{})}},catalog:s.catalog||null,revisions:s.revisions||[],scheduleSchema:Number(s.scheduleSchema||0)};}catch{}
+let state=clone(DEFAULT);try{const s=JSON.parse(localStorage.getItem(KEY)||localStorage.getItem(OLD)||'null');if(s&&s.eyes)state={...state,eyes:{left:{...DEFAULT.eyes.left,...s.eyes.left},right:{...DEFAULT.eyes.right,...s.eyes.right}},done:s.done||{},drugSessions:{...DEFAULT.drugSessions,...s.drugSessions},sessions:s.sessions||DEFAULT.sessions,dLeadHours:[1,2,3].includes(Number(s.dLeadHours))?Number(s.dLeadHours):1,gap:Number.isInteger(Number(s.gap??s.dry?.gap))&&Number(s.gap??s.dry?.gap)>=5&&Number(s.gap??s.dry?.gap)<=10?Number(s.gap??s.dry?.gap):10,dry:{...DEFAULT.dry,...s.dry,endDates:{...DEFAULT.dry.endDates,...(s.dry?.endDates||{})}},catalog:s.catalog||null,revisions:s.revisions||[],scheduleSchema:Number(s.scheduleSchema||0),remoteSchedule:s.remoteSchedule||null};}catch{}
 if(state.sessions==='07:00,12:00,15:00,21:00')state.sessions='07:00,12:00,17:00,21:00';
 // v0.9부터 기본 오후 시간을 17:00로 변경합니다. 이전 버전 기록도 유지합니다.
 const CATALOG_IDS=['A','B','C','D','E'];
@@ -288,8 +288,71 @@ function conflictPanel(items,context){
  const hits=spacingConflicts(items);if(!hits.length)return '';
  return `<div class="card"><div class="warn"><strong>점안 간격 확인 필요 · ${hits.length}건</strong><p>${esc(fmt(context))} 일정에서 서로 다른 안약의 간격이 설정한 ${state.gap}분보다 짧습니다. 자동으로 시간을 이동하지 않습니다. 병원 지침을 확인한 뒤 설정에서 시간을 직접 수정하세요.</p>${hits.map(x=>`<div>• ${esc(eyeNames[x.eye])}: ${esc(x.a.time)} ${esc(drugLabel(x.a))} ↔ ${esc(x.b.time)} ${esc(drugLabel(x.b))} (${x.diff}분)</div>`).join('')}</div></div>`;
 }
+// GitHub Pages에서 내려받는 읽기 전용 스케줄 상태. 체크 기록은 이 기기 안에만 남습니다.
+let remoteChecking=false,remoteError='';
+const REMOTE_URL='./remote-schedule.json';
+function remotePanel(){
+ const remote=state.remoteSchedule;
+ const current=dayOf(new Date());
+ const expires=remote?.validThrough?.slice(0,10);
+ const expired=expires && current>expires;
+ let text=remote?`원격 시간표 적용: ${esc(remote.effectiveAt.replace('T',' ').slice(0,16))}부터 · 확인된 기간: ${esc(expires||'미지정')}까지`:'원격 시간표를 아직 받지 못했습니다. 현재 기기에 저장된 일정을 표시합니다.';
+ if(expired)text+='<br><strong>⚠ 이 일정은 확인된 기간이 지났습니다. 병원 지침에 따른 최신 시간표를 확인하세요.</strong>';
+ return `<div class="card"><div class="section-title">원격 점안 시간표</div><div class="note">${text}</div><div class="note">${remote?.checkedAt?'마지막 확인: '+esc(remote.checkedAt.replace('T',' ').slice(0,19)):'업데이트 미확인'}${remoteError?'<br>⚠ '+esc(remoteError):''}</div><button class="button secondary" type="button" id="check-remote" ${remoteChecking?'disabled':''}>${remoteChecking?'새 일정 확인 중…':'↻ 새 일정 확인'}</button></div>`;
+}
+function remoteConfiguration(input){
+ if(!input||typeof input!=='object'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(input.effectiveAt||''))throw new Error('일정 적용 시각 오류');
+ if(typeof input.revisionId!=='string'||!/^[-_a-zA-Z0-9]{1,80}$/.test(input.revisionId))throw new Error('일정 버전 오류');
+ if(!Array.isArray(input.medicines)||input.medicines.length<1||input.medicines.length>40)throw new Error('안약 목록 오류');
+ const ids=new Set();
+ const catalog=input.medicines.map(m=>{
+  if(!m||typeof m.id!=='string'||!/^[-_a-zA-Z0-9]{1,90}$/.test(m.id)||ids.has(m.id))throw new Error('중복 또는 잘못된 안약 ID');
+  ids.add(m.id);
+  if(typeof m.name!=='string'||!m.name.trim()||m.name.length>50)throw new Error('안약 이름 오류');
+  const eyes={};for(const eye of ['left','right']){
+   const times=m.eyes?.[eye];
+   if(!Array.isArray(times)||times.length>24||times.some(t=>!validTime(t))||new Set(times).size!==times.length)throw new Error(m.name+'의 '+eye+' 점안 시간 오류');
+   eyes[eye]={enabled:times.length>0,times:[...times].sort()};
+  }
+  return {id:m.id,name:m.name.trim(),enabled:m.enabled!==false,eyes};
+ });
+ const gap=Number(input.minGapMinutes);
+ if(!Number.isInteger(gap)||gap<5||gap>10)throw new Error('최소 간격 오류');
+ if(input.validThrough && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(input.validThrough))throw new Error('확인 기간 오류');
+ return {catalog,gap};
+}
+async function checkRemoteSchedule(){
+ if(remoteChecking)return;
+ remoteChecking=true;remoteError='';if(tab==='today')render();
+ try{
+  const response=await fetch(REMOTE_URL+'?v='+Date.now(),{cache:'no-store'});
+  if(!response.ok)throw new Error('HTTP '+response.status);
+  const payload=await response.json(),cfg=remoteConfiguration(payload);
+  const oldRemote=state.remoteSchedule;
+  if(oldRemote && payload.effectiveAt<oldRemote.effectiveAt && payload.revisionId!==oldRemote.revisionId)throw new Error('기존보다 오래된 스케줄입니다');
+  if(!oldRemote||oldRemote.revisionId!==payload.revisionId){
+   // 기존 과거 설정과 완료 체크는 그대로 두고 적용시각 이후의 일정만 변경합니다.
+   // 이후 수정본을 배포할 때는 새 revisionId와 더 늦은 effectiveAt을 사용합니다.
+   const snapshot=configSnapshot();
+   const revs=(state.revisions||[]).filter(r=>r.at<payload.effectiveAt);
+   if(!revs.length)revs.push({at:'0000-01-01T00:00:00',settings:snapshot});
+   const updated={...snapshot,catalog:cfg.catalog,gap:cfg.gap,scheduleSchema:21};
+   revs.push({at:payload.effectiveAt,settings:updated,remoteId:payload.revisionId});
+   state.revisions=revs;
+   state.catalog=cfg.catalog;state.gap=cfg.gap;state.scheduleSchema=21;
+  }
+  state.remoteSchedule={revisionId:payload.revisionId,effectiveAt:payload.effectiveAt,validThrough:payload.validThrough||'',checkedAt:stampLocal()};
+  save();
+ }catch(error){remoteError='최신 시간표를 가져오지 못했습니다 ('+(error?.message||'연결 오류')+'). 저장된 일정은 유지됩니다.';}
+ finally{remoteChecking=false;if(tab==='today')render();}
+}
+let lastRemoteCheck=0;
+function checkRemoteIfNeeded(force=false){
+ if(document.visibilityState==='hidden')return;
+ if(force||Date.now()-lastRemoteCheck>5*60*1000){lastRemoteCheck=Date.now();checkRemoteSchedule();}
+}
 function today(){const items=doses(selected),cells=allCells(items),done=cells.filter(({d,e})=>isDone(d,e)).length;
- let html=datebar()+status()+`<div class="card"><div class="section-title">점안 현황</div><div class="stat">${done} / ${cells.length}회 완료</div><div class="track"><div class="fill" style="width:${cells.length?done/cells.length*100:0}%"></div></div><div class="note">왼쪽·오른쪽 눈을 각각 체크하세요. 회색 체크박스는 해당 눈의 점안 대상이 아닙니다.</div></div>`;
+ let html=datebar()+remotePanel()+status()+`<div class="card"><div class="section-title">점안 현황</div><div class="stat">${done} / ${cells.length}회 완료</div><div class="track"><div class="fill" style="width:${cells.length?done/cells.length*100:0}%"></div></div><div class="note">왼쪽·오른쪽 눈을 각각 체크하세요. 회색 체크박스는 해당 눈의 점안 대상이 아닙니다.</div></div>`;
  html+=conflictPanel(items,selected);
  return html+(items.length?checklist(items):'<div class="card empty">이 날짜에 표시할 안약 일정이 없습니다.</div>');
 }
@@ -337,8 +400,9 @@ function render(){
 }
 document.addEventListener('click',e=>{
  const b=e.target.closest('[data-tab]');
- if(b){tab=b.dataset.tab;editorCatalog=null;render();return;}
+ if(b){tab=b.dataset.tab==='settings'?'today':b.dataset.tab;editorCatalog=null;render();return;}
  if(e.target.id==='go-today'){selected=dayOf(new Date());render();}
+ if(e.target.id==='check-remote'){checkRemoteIfNeeded(true);return;}
 });
 function refreshCount(group){if(!group)return;const count=document.querySelector(`[data-count="${group.dataset.times}"]`);if(count)count.textContent=group.querySelectorAll('input[type="time"]').length+'회/일';}
 function saveFormDraft(){return [...document.querySelectorAll('#settings-form input[id]')].map(el=>({id:el.id,checked:el.checked,value:el.value,type:el.type}));}
@@ -376,4 +440,4 @@ document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e
  recordRevision(oldConfig);save();editorCatalog=null;
  alert('설정이 저장되었습니다. 이전 일정과 기록은 그대로 유지됩니다.');render();
 });
-render();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
+render();checkRemoteIfNeeded(true);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')checkRemoteIfNeeded(true);});window.addEventListener('focus',()=>checkRemoteIfNeeded());window.addEventListener('online',()=>checkRemoteIfNeeded(true));setInterval(()=>checkRemoteIfNeeded(),60000);if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
