@@ -2,134 +2,135 @@ import {firebaseConfig} from './firebase-config.js';
 const CONFIG_OK=!!(firebaseConfig?.apiKey && firebaseConfig.apiKey!=='REPLACE_ME' && firebaseConfig?.projectId && firebaseConfig.projectId!=='REPLACE_ME');
 const ROLE_KEY='eyedrop-cloud-role',FAMILY_KEY='eyedrop-cloud-family';
 const PENDING_RECORDS='eyedrop-cloud-pending-records-v18',PENDING_SETTINGS='eyedrop-cloud-pending-settings-v18';
+const $=id=>document.getElementById(id),safe=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function read(k,defaultValue){try{return JSON.parse(localStorage.getItem(k))??defaultValue;}catch{return defaultValue;}}
 let role=localStorage.getItem(ROLE_KEY)||'',familyId=localStorage.getItem(FAMILY_KEY)||'';
-let auth,db,user,familyRef,unsubFamily,unsubRecords,api,ready=false,migrationPromise=null,flushPromise=null;
 let pendingRecords=read(PENDING_RECORDS,{}),pendingSettings=read(PENDING_SETTINGS,null);
-let listenFamily=false,listenRecords=false,lastServerCheck=0,refreshPromise=null,refreshTimer=null,lastResumeCheck=0;
-const $=id=>document.getElementById(id);
-function read(key,fallback){try{const value=JSON.parse(localStorage.getItem(key));return value??fallback;}catch{return fallback;}}
+let auth,db,api,user,ready=false,unsubFamily,unsubRecords,flushPromise=null,refreshPromise=null,migrationPromise=null;
+let gotFamily=false,gotRecords=false,lastServerCheck=0,lastError='',retryTimer=null,setupPromise=null;
 function persist(){localStorage.setItem(PENDING_RECORDS,JSON.stringify(pendingRecords));if(pendingSettings)localStorage.setItem(PENDING_SETTINGS,JSON.stringify(pendingSettings));else localStorage.removeItem(PENDING_SETTINGS);}
-const safe=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function status(message){window.eyeCloudStatus=message;const el=$('cloud-status');if(el)el.textContent=message;const summary=$('cloud-summary');if(summary)summary.textContent=message;}
-function error(e){console.error(e);status('오류: '+(e?.code||e?.message||String(e)));}
-function panel(){const target=$('sync-ui');if(!target)return;
- if(!CONFIG_OK){target.innerHTML='<div class="warn">Firebase 설정이 없습니다. 기존 v1.7에서 사용했던 firebase-config.js를 v1.9 폴더로 복사해야 연결됩니다. 기존 로컬 기록은 유지됩니다.</div>';return;}
- const logged=!!user,state=role==='mother'?'어머니 A33':role==='parent'?'보호자 아이폰':'역할 선택 전';
- target.innerHTML=`<div class="sync-muted">역할: ${safe(state)} · <span id="cloud-status">${safe(window.eyeCloudStatus||'대기')}</span></div>
- <div class="sync-block"><strong>기록 보호</strong><p class="sync-muted">현재 휴대폰의 기존 설정과 점안 기록을 JSON 파일로 보관할 수 있습니다. 파일은 외부에 공개하지 마세요.</p><button class="sync-button secondary" id="cloud-backup">현재 기기 기록 백업</button></div>
- ${!logged?`<div class="sync-block"><strong>어머니 A33 — 최초 1회 연결</strong><button class="sync-button" id="cloud-mother">어머니 기기 연결 시작</button><p class="sync-muted">익명 인증을 사용합니다. 앱/브라우저 데이터를 삭제하면 이 연결이 복구되지 않을 수 있습니다.</p></div><div class="sync-block"><strong>보호자 아이폰 — 계정 생성 또는 로그인</strong><input class="sync-input" type="email" id="cloud-email" placeholder="이메일 주소"><input class="sync-input" type="password" id="cloud-pass" placeholder="비밀번호 (6자 이상)"><button class="sync-button" id="cloud-register">보호자 계정 만들기</button><button class="sync-button" id="cloud-login">기존 보호자 계정 로그인</button></div>`:''}
- ${logged?`<div class="sync-block"><p class="sync-muted">내 사용자 ID: <strong>${safe(user.uid)}</strong></p><button class="sync-button secondary" id="cloud-copy-uid">내 사용자 ID 복사</button>${role==='mother'?`<strong>보호자 연결 승인</strong><input class="sync-input" id="cloud-caregiver" placeholder="아이폰에서 복사한 보호자 UID"><button class="sync-button" id="cloud-pair">보호자 연결 승인</button>`:`<strong>어머니 기록 연결</strong><input class="sync-input" id="cloud-family-id" placeholder="어머니 A33 사용자 UID" value="${safe(familyId)}"><button class="sync-button" id="cloud-join">어머니 기록 연결</button>`}</div>`:''}
- ${logged&&role==='mother'?`<div class="sync-block"><strong>기록 전송 상태</strong><p class="sync-muted">처음 연결하면 이미 체크한 점안 기록을 전송합니다. 누락이나 네트워크 오류가 있다면 재시도하세요. 기기 안 기록은 삭제하지 않습니다.</p><button class="sync-button secondary" id="cloud-retry">기존 기록 업로드 확인·재시도</button></div>`:''}
- <p class="sync-muted">☁ 연결됨이 표시되고 실제 두 기기의 체크 항목이 일치해야 연결 완료입니다. 인터넷이 없을 때 변경 사항은 이 기기에 보관되며 연결 복구 후 재전송을 시도합니다.</p>`;
- target.onclick=async e=>{const id=e.target?.id;if(!id)return;try{
+function status(msg){window.eyeCloudStatus=msg;for(const id of ['cloud-status','cloud-summary']){const el=$(id);if(el)el.textContent=msg;}}
+function statusFromSync(){const count=Object.keys(pendingRecords).length+(pendingSettings?1:0);
+ if(count){status(`클라우드 전송 대기 ${count}건${lastError?' · '+lastError:''}`);return;}
+ if(gotFamily&&gotRecords){status('클라우드 연결됨 · 서버 확인 '+new Date(lastServerCheck||Date.now()).toLocaleTimeString('ko-KR'));return;}
+ status(user?'서버 연결 확인 중':'로그인 또는 기기 연결 대기');
+}
+function showError(err){lastError=String(err?.code||err?.message||err).slice(0,110);console.error('[eye cloud]',err);statusFromSync();if(!Object.keys(pendingRecords).length&&!pendingSettings)status('클라우드 오류: '+lastError);}
+// Register event handlers BEFORE slow Firebase SDK imports or authentication restoration.
+function queueRecord({key,value}){if(role!=='mother')return;pendingRecords={...read(PENDING_RECORDS,{}),...pendingRecords,[key]:!!value};persist();lastError='';statusFromSync();scheduleSend(0);}
+function queueSettings({settings}){if(role!=='parent')return;pendingSettings=settings;persist();lastError='';statusFromSync();scheduleSend(0);}
+window.addEventListener('eye-record-change',e=>queueRecord(e.detail));
+window.addEventListener('eye-settings-change',e=>queueSettings(e.detail));
+function scheduleSend(delay=0){if(retryTimer)clearTimeout(retryTimer);retryTimer=setTimeout(()=>{retryTimer=null;flush().catch(showError);},delay);}
+function panel(){const el=$('sync-ui');if(!el)return;
+ if(!CONFIG_OK){el.innerHTML='<div class="warn">Firebase 설정이 없습니다. 기존 버전의 firebase-config.js를 복사해야 합니다. 기존 기록은 보존됩니다.</div>';return;}
+ const logged=!!user,mode=role==='mother'?'어머니 A33':role==='parent'?'보호자 아이폰':'기기 선택 전';
+ el.innerHTML=`<div class="sync-muted">역할: ${safe(mode)} · <span id="cloud-status">${safe(window.eyeCloudStatus||'준비 중')}</span></div>
+ <div class="sync-block"><strong>기록 백업</strong><p class="sync-muted">연결 오류가 있어도 현재 기기의 기록을 보존합니다. 백업 파일은 공개하지 마세요.</p><button class="sync-button secondary" id="cloud-backup">현재 기기 기록 백업</button></div>
+ ${!logged?`<div class="sync-block"><strong>어머니 기기 연결</strong><button class="sync-button" id="cloud-mother">어머니 기기 연결 시작</button></div><div class="sync-block"><strong>보호자 계정</strong><input class="sync-input" id="cloud-email" type="email" placeholder="이메일 주소"><input class="sync-input" id="cloud-pass" type="password" placeholder="비밀번호"><button class="sync-button" id="cloud-register">보호자 계정 만들기</button><button class="sync-button" id="cloud-login">기존 보호자 계정 로그인</button></div>`:''}
+ ${logged?`<div class="sync-block"><p class="sync-muted">내 사용자 ID: <strong>${safe(user.uid)}</strong></p><button class="sync-button secondary" id="cloud-copy-uid">내 사용자 ID 복사</button>${role==='mother'?`<strong>보호자 연결 승인</strong><input class="sync-input" id="cloud-caregiver" placeholder="보호자 UID"><button class="sync-button" id="cloud-pair">보호자 연결 승인</button>`:`<strong>어머니 기록 연결</strong><input class="sync-input" id="cloud-family-id" placeholder="어머니 UID" value="${safe(familyId)}"><button class="sync-button" id="cloud-join">어머니 기록 연결</button>`}</div>`:''}
+ ${logged?`<div class="sync-block"><strong>동기화 상태</strong><p class="sync-muted">전송 대기 건수: ${Object.keys(pendingRecords).length+(pendingSettings?1:0)}건 · 마지막 서버 확인: ${lastServerCheck?new Date(lastServerCheck).toLocaleString('ko-KR'):'아직 확인 전'}</p><button class="sync-button secondary" id="cloud-refresh">지금 동기화 확인·재시도</button>${role==='mother'?'<button class="sync-button secondary" id="cloud-migrate">기존 기록 누락 확인·재업로드</button>':''}</div>`:''}
+ <p class="sync-muted">실제 서버 저장이 확인된 건만 전송 대기에서 사라집니다. 인터넷이 끊겨도 이 기기의 기록은 남지만, 다른 기기에서 보이기까지 지연될 수 있습니다.</p>`;
+ el.onclick=async e=>{const id=e.target?.id;if(!id)return;try{
   if(id==='cloud-backup')backup();
   if(id==='cloud-mother')await startMother();
   if(id==='cloud-register'||id==='cloud-login')await parentAuth(id==='cloud-register');
-  if(id==='cloud-copy-uid'){if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(user.uid);else throw Error('UID를 길게 눌러 복사해 주세요.');status('사용자 ID 복사 완료');}
+  if(id==='cloud-copy-uid'){await navigator.clipboard.writeText(user.uid);status('사용자 ID 복사 완료');}
   if(id==='cloud-pair')await approveCaregiver($('cloud-caregiver').value.trim());
   if(id==='cloud-join')await joinFamily($('cloud-family-id').value.trim());
-  if(id==='cloud-retry')await ensureMotherAndSubscribe(true);
- }catch(ex){error(ex);}}
+  if(id==='cloud-refresh'){await flush();await refreshFromServer();}
+  if(id==='cloud-migrate')await migrateRecords();
+ }catch(ex){showError(ex);}}
 }
-function backup(){const blob=new Blob([JSON.stringify({version:'1.9',exportedAt:new Date().toISOString(),data:window.eyeBridge.exportBackup()},null,2)],{type:'application/json'});const link=document.createElement('a');const url=URL.createObjectURL(blob);link.href=url;link.download='eyedrop-backup-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);status('기기 내 기록 백업 파일 생성됨');}
-function queueRecord(detail){pendingRecords[detail.key]=!!detail.value;persist();status('기기에 저장됨 · 클라우드 전송 대기');if(ready)flush().catch(error);}
-function queueSettings(detail){if(role!=='parent')return;pendingSettings=detail.settings;persist();status('설정 저장됨 · 클라우드 전송 대기');if(ready)flush().catch(error);}
+function backup(){const blob=new Blob([JSON.stringify({version:'2.0',exportedAt:new Date().toISOString(),data:window.eyeBridge.exportBackup()},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='eyedrop-backup-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);status('기록 백업 파일 생성됨');}
 async function init(){if(!CONFIG_OK){status('Firebase 설정 필요');panel();return;}
  const [{initializeApp},{getAuth,onAuthStateChanged,signInAnonymously,createUserWithEmailAndPassword,signInWithEmailAndPassword},{initializeFirestore,persistentLocalCache,persistentMultipleTabManager,doc,getDoc,getDocFromServer,getDocsFromServer,setDoc,updateDoc,collection,writeBatch,onSnapshot,serverTimestamp}]=await Promise.all([
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js'),
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js'),
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js')]);
- const app=initializeApp(firebaseConfig);auth=getAuth(app);db=initializeFirestore(app,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})});
+ const app=initializeApp(firebaseConfig);auth=getAuth(app);
+ db=initializeFirestore(app,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})});
  api={signInAnonymously,createUserWithEmailAndPassword,signInWithEmailAndPassword,doc,getDoc,getDocFromServer,getDocsFromServer,setDoc,updateDoc,collection,writeBatch,onSnapshot,serverTimestamp};
- window.addEventListener('eye-record-change',e=>{if(role==='mother')queueRecord(e.detail);});
- window.addEventListener('eye-settings-change',e=>{if(role==='parent')queueSettings(e.detail);});
- // iOS Safari / Android PWA can suspend snapshot listeners when backgrounded.
- // Use a server refresh on resume and periodic light verification while foregrounded.
- window.addEventListener('online',()=>resumeSync(true));
- window.addEventListener('focus',()=>resumeSync());
- window.addEventListener('pageshow',()=>resumeSync());
- document.addEventListener('visibilitychange',()=>{if(!document.hidden)resumeSync();});
- refreshTimer=setInterval(()=>{if(!document.hidden&&navigator.onLine&&user&&familyId)refreshFromServer().catch(error);},30000);
- onAuthStateChanged(auth,async u=>{user=u;panel();if(!u){ready=false;status('로그인 또는 기기 연결이 필요합니다.');return;}
-  try{if(role==='mother'){familyId=u.uid;localStorage.setItem(FAMILY_KEY,familyId);pendingSettings=null;persist();window.eyeBridge.setRole('mother');await ensureMotherAndSubscribe();}
-   else if(role==='parent'&&familyId){window.eyeBridge.setRole('parent');await subscribe();}
-   else status('로그인됨 · 기기 연결 대기');}catch(ex){error(ex);}
+ onAuthStateChanged(auth,u=>{user=u;ready=false;panel();if(!u){status('로그인 또는 기기 연결 필요');return;}
+  if(role==='mother'){familyId=u.uid;localStorage.setItem(FAMILY_KEY,familyId);window.eyeBridge.setRole('mother');setupMother().catch(showError);}
+  else if(role==='parent'){window.eyeBridge.setRole('parent');if(familyId)subscribe();else status('로그인됨 · 어머니 연결 대기');}
+  else status('기기 역할 선택 필요');
  });
- status('연결 기능 로드됨');panel();
+ for(const type of ['pageshow','focus','online'])window.addEventListener(type,()=>resume());
+ document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume();});
+ // A fallback check also recovers from mobile browsers that silently suspend listeners.
+ setInterval(()=>{if(!document.hidden&&navigator.onLine&&user&&familyId){scheduleSend(0);refreshFromServer().catch(showError);}},20000);
+ status('Firebase 로그인 복원 중');panel();
 }
-async function migrateExistingRecords(){if(role!=='mother'||!user)return;
- const ref=api.doc(db,'families',user.uid);const family=await api.getDoc(ref);
- if(!family.exists())await api.setDoc(ref,{ownerUid:user.uid,caregiverUid:'',settings:window.eyeBridge.getSettings(),updatedAt:api.serverTimestamp()});
- // Always check the remote collection; a previous partial upload must be recoverable.
- const remote=await api.getDocsFromServer(api.collection(db,'families',user.uid,'records'));
- const existing=new Set(remote.docs.map(x=>x.id));
- const local=Object.entries(window.eyeBridge.getDone()).filter(([key,value])=>!!value && !existing.has(encodeURIComponent(key)) && !(key in pendingRecords));
- status('기존 점안 기록 확인 중 · 미전송 '+local.length+'건');
- for(let i=0;i<local.length;i+=300){const batch=api.writeBatch(db);for(const [key,value] of local.slice(i,i+300))batch.set(api.doc(db,'families',user.uid,'records',encodeURIComponent(key)),{value:!!value,updatedAt:api.serverTimestamp()});await batch.commit();}
- status('기존 기록 확인 완료 · 추가 전송 '+local.length+'건');
+async function setupMother(){if(!user||role!=='mother')return;if(setupPromise)return setupPromise;
+ setupPromise=(async()=>{const ref=api.doc(db,'families',user.uid),doc=await api.getDoc(ref);
+ if(!doc.exists())await api.setDoc(ref,{ownerUid:user.uid,caregiverUid:'',settings:window.eyeBridge.getSettings(),updatedAt:api.serverTimestamp()});
+ subscribe();scheduleSend(0);
+ // Only migrate after pending edits have had a chance to reach the server.
+ flush().then(()=>{if(!Object.keys(pendingRecords).length)migrateRecords().catch(showError);}).catch(showError);})().finally(()=>setupPromise=null);return setupPromise;
 }
-async function ensureMotherAndSubscribe(force=false){if(role!=='mother'||!user)return;if(migrationPromise)return migrationPromise;
- migrationPromise=(async()=>{ready=false;try{await migrateExistingRecords();await subscribe(force);await flush();}catch(e){status('기록 동기화 확인 실패 · 연결 탭에서 재시도 가능');throw e;}finally{migrationPromise=null;}})();return migrationPromise;
-}
-async function startMother(){if(!auth)throw Error('Firebase 설정이 필요합니다.');if(auth.currentUser&&role==='parent')throw Error('보호자 로그인된 브라우저에서는 어머니 연결을 시작할 수 없습니다.');
+async function startMother(){if(auth.currentUser&&role==='parent')throw Error('보호자 계정과 어머니 기기를 같은 브라우저에서 연결하지 마세요.');
  role='mother';localStorage.setItem(ROLE_KEY,role);pendingSettings=null;persist();window.eyeBridge.setRole('mother');
- if(!auth.currentUser){const result=await api.signInAnonymously(auth);user=result.user;}else user=auth.currentUser;
- familyId=user.uid;localStorage.setItem(FAMILY_KEY,familyId);await ensureMotherAndSubscribe();panel();}
-async function parentAuth(register){const email=$('cloud-email').value.trim(),pass=$('cloud-pass').value;if(!email||!pass)throw Error('이메일과 비밀번호를 입력하세요.');
+ if(!auth.currentUser){const x=await api.signInAnonymously(auth);user=x.user;}else user=auth.currentUser;
+ familyId=user.uid;localStorage.setItem(FAMILY_KEY,familyId);await setupMother();panel();}
+async function parentAuth(register){const email=$('cloud-email')?.value.trim(),pass=$('cloud-pass')?.value;if(!email||!pass)throw Error('이메일·비밀번호를 입력하세요.');
  const result=register?await api.createUserWithEmailAndPassword(auth,email,pass):await api.signInWithEmailAndPassword(auth,email,pass);
- user=result.user;role='parent';localStorage.setItem(ROLE_KEY,role);window.eyeBridge.setRole('parent');status('로그인됨 · 어머니 기기에서 내 UID 승인 필요');panel();}
+ role='parent';localStorage.setItem(ROLE_KEY,role);user=result.user;window.eyeBridge.setRole('parent');status('보호자 로그인 완료');panel();if(familyId)subscribe();}
 async function approveCaregiver(uid){if(role!=='mother'||!user)throw Error('어머니 기기에서만 승인할 수 있습니다.');if(!/^[A-Za-z0-9]{15,128}$/.test(uid)||uid===user.uid)throw Error('보호자 UID를 확인해 주세요.');
- await api.updateDoc(api.doc(db,'families',user.uid),{caregiverUid:uid,updatedAt:api.serverTimestamp()});status('보호자 승인 완료 · 아이폰에 어머니 UID를 입력하세요.');}
-async function joinFamily(uid){if(role!=='parent'||!user)throw Error('보호자 계정으로 로그인해 주세요.');if(!/^[A-Za-z0-9]{15,128}$/.test(uid))throw Error('어머니 UID를 확인해 주세요.');
- const ref=api.doc(db,'families',uid),snap=await api.getDoc(ref);if(!snap.exists()||snap.data().caregiverUid!==user.uid)throw Error('A33에서 보호자 승인 여부를 확인해 주세요.');
- familyId=uid;localStorage.setItem(FAMILY_KEY,uid);await subscribe();panel();}
-async function subscribe(){if(!user||!familyId)return;ready=false;listenFamily=false;listenRecords=false;
- if(unsubFamily)unsubFamily();if(unsubRecords)unsubRecords();
- familyRef=api.doc(db,'families',familyId);status('클라우드 연결 중…');
- unsubFamily=api.onSnapshot(familyRef,{includeMetadataChanges:true},snap=>{if(!snap.exists()){status('가족 데이터가 없습니다.');return;}
-   if(snap.data().settings&&!pendingSettings)window.eyeBridge.applySettings(snap.data().settings);
-   listenFamily=!snap.metadata.fromCache;if(listenFamily)lastServerCheck=Date.now();updateConnectedStatus();
- },error);
- unsubRecords=api.onSnapshot(api.collection(db,'families',familyId,'records'),{includeMetadataChanges:true},snapshot=>{
-  const result={};snapshot.docs.forEach(doc=>{try{const key=decodeURIComponent(doc.id);if(!(key in pendingRecords))result[key]=!!doc.data().value;}catch{}});
-  window.eyeBridge.applyDone(result,role==='parent');listenRecords=!snapshot.metadata.fromCache;if(listenRecords)lastServerCheck=Date.now();updateConnectedStatus();
- },error);
- window.eyeBridge.setRole(role);panel();ready=true;}
-function updateConnectedStatus(){if(listenFamily&&listenRecords){const count=Object.keys(pendingRecords).length+(pendingSettings?1:0);status(count?'클라우드 연결됨 · 전송 대기 '+count+'건':'클라우드 연결됨 · 최신 확인 '+new Date(lastServerCheck||Date.now()).toLocaleTimeString('ko-KR')); }else status('로컬 기록 표시 중 · 서버 연결 확인 중');}
-async function refreshFromServer(){
- if(!user||!familyId||!navigator.onLine||document.hidden)return;
- if(refreshPromise)return refreshPromise;
- refreshPromise=(async()=>{try{
-  // A fresh server read repairs a display that did not repaint after an onSnapshot callback.
-  const familySnap=await api.getDocFromServer(api.doc(db,'families',familyId));
-  if(!familySnap.exists())throw Error('가족 데이터가 없습니다.');
-  if(familySnap.data().settings && !(role==='parent'&&pendingSettings))window.eyeBridge.applySettings(familySnap.data().settings);
-  const recordSnap=await api.getDocsFromServer(api.collection(db,'families',familyId,'records'));
-  const result={};recordSnap.docs.forEach(doc=>{try{const k=decodeURIComponent(doc.id);if(!(k in pendingRecords))result[k]=!!doc.data().value;}catch{}});
-  window.eyeBridge.applyDone(result,role==='parent');
-  listenFamily=true;listenRecords=true;lastServerCheck=Date.now();updateConnectedStatus();
- }catch(ex){status('최신 기록 확인 지연 · 네트워크/권한 확인 필요');throw ex;}finally{refreshPromise=null;}})();
- return refreshPromise;
+ await api.updateDoc(api.doc(db,'families',user.uid),{caregiverUid:uid,updatedAt:api.serverTimestamp()});status('보호자 승인 완료');}
+async function joinFamily(uid){if(role!=='parent'||!user)throw Error('보호자 로그인 후 진행해 주세요.');if(!/^[A-Za-z0-9]{15,128}$/.test(uid))throw Error('어머니 UID를 확인해 주세요.');
+ const snap=await api.getDocFromServer(api.doc(db,'families',uid));if(!snap.exists()||snap.data().caregiverUid!==user.uid)throw Error('어머니 기기에서 보호자 승인 여부를 확인해 주세요.');
+ familyId=uid;localStorage.setItem(FAMILY_KEY,uid);subscribe();panel();}
+function subscribe(){if(!user||!familyId)return;
+ if(unsubFamily)unsubFamily();if(unsubRecords)unsubRecords();gotFamily=false;gotRecords=false;
+ const path=api.doc(db,'families',familyId);
+ unsubFamily=api.onSnapshot(path,{includeMetadataChanges:true},snap=>{
+  if(!snap.exists()){status('가족 문서를 찾을 수 없습니다.');return;}
+  if(snap.data().settings&&!pendingSettings)window.eyeBridge.applySettings(snap.data().settings);
+  gotFamily=!snap.metadata.fromCache;if(gotFamily)lastServerCheck=Date.now();statusFromSync();
+ },showError);
+ unsubRecords=api.onSnapshot(api.collection(db,'families',familyId,'records'),{includeMetadataChanges:true},snap=>{
+  const records={};snap.docs.forEach(d=>{try{const k=decodeURIComponent(d.id);if(!(k in pendingRecords))records[k]=!!d.data().value;}catch{}});
+  window.eyeBridge.applyDone(records,role==='parent');gotRecords=!snap.metadata.fromCache;if(gotRecords)lastServerCheck=Date.now();statusFromSync();
+ },showError);
+ ready=true;statusFromSync();scheduleSend(0);panel();
 }
-function resumeSync(force=false){
- if(!user||!familyId||!navigator.onLine||document.hidden)return;
- const now=Date.now();if(!force&&now-lastResumeCheck<1500)return;lastResumeCheck=now;
- if(role==='mother'){
-   // Pending writes go to the server first, then refresh; avoid stale server data hiding pending edits.
-   flush().then(()=>refreshFromServer()).catch(error);
- }else{
-   flush().then(()=>refreshFromServer()).catch(error);
- }
+async function migrateRecords(){if(role!=='mother'||!user||!ready)return;if(migrationPromise)return migrationPromise;
+ migrationPromise=(async()=>{
+  // Missing true records only; a local pending false edit must never be overwritten by migration.
+  const remote=await api.getDocsFromServer(api.collection(db,'families',user.uid,'records'));
+  const existing=new Set(remote.docs.map(d=>d.id));
+  const missing=Object.entries(window.eyeBridge.getDone()).filter(([k,v])=>v===true&&!existing.has(encodeURIComponent(k))&&!(k in pendingRecords));
+  for(let i=0;i<missing.length;i+=200){const batch=api.writeBatch(db);for(const [k] of missing.slice(i,i+200))batch.set(api.doc(db,'families',user.uid,'records',encodeURIComponent(k)),{value:true,updatedAt:api.serverTimestamp()});await batch.commit();}
+  if(missing.length)status('기존 기록 '+missing.length+'건 추가 업로드 완료');
+ })().finally(()=>migrationPromise=null);return migrationPromise;
 }
-async function flush(){if(!ready||!user||!familyId||!navigator.onLine)return;if(flushPromise)return flushPromise;
+async function flush(){if(!ready||!user||!familyId||!navigator.onLine)return;if(flushPromise)return flushPromise;pendingRecords={...read(PENDING_RECORDS,{}),...pendingRecords};if(role==='parent'&&!pendingSettings)pendingSettings=read(PENDING_SETTINGS,null);
  flushPromise=(async()=>{try{
-  // Keep pending edits on device until each server write succeeds.
-  if(role==='parent'&&pendingSettings){const value=pendingSettings;await api.updateDoc(api.doc(db,'families',familyId),{settings:value,updatedAt:api.serverTimestamp()});if(pendingSettings===value)pendingSettings=null;persist();}
-  for(const [key,value] of Object.entries(role==='mother'?{...pendingRecords}:{})){
-    await api.setDoc(api.doc(db,'families',familyId,'records',encodeURIComponent(key)),{value,updatedAt:api.serverTimestamp()});
-    if(pendingRecords[key]===value)delete pendingRecords[key];persist();
+  if(role==='parent'&&pendingSettings){const value=pendingSettings;
+   await api.updateDoc(api.doc(db,'families',familyId),{settings:value,updatedAt:api.serverTimestamp()});
+   if(pendingSettings===value)pendingSettings=null;persist();}
+  if(role==='mother')for(const [key,value] of Object.entries({...pendingRecords})){
+   await api.setDoc(api.doc(db,'families',familyId,'records',encodeURIComponent(key)),{value,updatedAt:api.serverTimestamp()});
+   if(pendingRecords[key]===value)delete pendingRecords[key];persist();
   }
-  updateConnectedStatus();
- }catch(e){status('전송 대기 중 · 네트워크/권한 확인 필요');console.error(e);}finally{flushPromise=null;}})();return flushPromise;}
+  lastError='';statusFromSync();
+ }catch(ex){lastError=String(ex?.code||ex?.message||ex).slice(0,100);statusFromSync();console.error(ex);scheduleSend(9000);
+ }finally{flushPromise=null;if((Object.keys(pendingRecords).length||pendingSettings)&&navigator.onLine)scheduleSend(10000);}})();return flushPromise;
+}
+async function refreshFromServer(){if(!ready||!user||!familyId||!navigator.onLine||document.hidden)return;if(refreshPromise)return refreshPromise;
+ refreshPromise=(async()=>{try{
+  const family=await api.getDocFromServer(api.doc(db,'families',familyId));
+  if(family.exists()&&family.data().settings&&!pendingSettings)window.eyeBridge.applySettings(family.data().settings);
+  const snap=await api.getDocsFromServer(api.collection(db,'families',familyId,'records'));
+  const records={};snap.docs.forEach(doc=>{try{const key=decodeURIComponent(doc.id);if(!(key in pendingRecords))records[key]=!!doc.data().value;}catch{}});
+  window.eyeBridge.applyDone(records,role==='parent');gotFamily=true;gotRecords=true;lastServerCheck=Date.now();lastError='';statusFromSync();
+ }finally{refreshPromise=null;}})();return refreshPromise;
+}
+function resume(){if(!user||!familyId||!navigator.onLine||document.hidden)return;
+ // Re-establish subscriptions when browsers resume after a frozen/backgrounded PWA.
+ if(!ready){if(role==='mother')setupMother().catch(showError);else if(role==='parent')subscribe();return;}
+ scheduleSend(0);refreshFromServer().catch(showError);
+}
 window.addEventListener('eye-sync-panel',panel);
-init().catch(error);
+init().catch(showError);
