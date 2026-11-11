@@ -8,7 +8,7 @@ let role=localStorage.getItem(ROLE_KEY)||'',familyId=localStorage.getItem(FAMILY
 let pendingRecords=read(PENDING_RECORDS,{}),pendingSettings=read(PENDING_SETTINGS,null);
 let auth,db,api,user,ready=false,unsubFamily,unsubRecords,flushPromise=null,refreshPromise=null,migrationPromise=null;
 let gotFamily=false,gotRecords=false,lastServerCheck=0,lastError='',retryTimer=null,setupPromise=null;
-let sendingSince=0,networkRecovering=false;
+let sendingSince=0,networkRecovering=false,lastSuccessAt=0,manualBusy=false;
 function persist(){localStorage.setItem(PENDING_RECORDS,JSON.stringify(pendingRecords));if(pendingSettings)localStorage.setItem(PENDING_SETTINGS,JSON.stringify(pendingSettings));else localStorage.removeItem(PENDING_SETTINGS);}
 function status(msg){window.eyeCloudStatus=msg;for(const id of ['cloud-status','cloud-summary']){const el=$(id);if(el)el.textContent=msg;}}
 function statusFromSync(){const count=Object.keys(pendingRecords).length+(pendingSettings?1:0);
@@ -40,18 +40,52 @@ function panel(){const el=$('sync-ui');if(!el)return;
   if(id==='cloud-copy-uid'){await navigator.clipboard.writeText(user.uid);status('사용자 ID 복사 완료');}
   if(id==='cloud-pair')await approveCaregiver($('cloud-caregiver').value.trim());
   if(id==='cloud-join')await joinFamily($('cloud-family-id').value.trim());
-  if(id==='cloud-refresh'){await flush();await refreshFromServer();}
+  if(id==='cloud-refresh')await manualSync();
   if(id==='cloud-migrate')await migrateRecords();
  }catch(ex){showError(ex);}}
 }
-function backup(){const blob=new Blob([JSON.stringify({version:'2.1',exportedAt:new Date().toISOString(),data:window.eyeBridge.exportBackup()},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='eyedrop-backup-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);status('기록 백업 파일 생성됨');}
+
+// HTTP writes are intentionally independent of Firestore's offline queue. Local pending
+// edits are the durable source of truth until an authenticated server response arrives.
+function firestoreField(value){
+ if(value===null||value===undefined)return {nullValue:null};
+ if(typeof value==='boolean')return {booleanValue:value};
+ if(typeof value==='number')return Number.isInteger(value)?{integerValue:String(value)}:{doubleValue:value};
+ if(typeof value==='string')return {stringValue:value};
+ if(Array.isArray(value))return {arrayValue:{values:value.map(firestoreField)}};
+ if(typeof value==='object')return {mapValue:{fields:Object.fromEntries(Object.entries(value).filter(([,v])=>v!==undefined).map(([k,v])=>[k,firestoreField(v)]))}};
+ throw Error('지원하지 않는 설정값');
+}
+const restPath=(...segments)=>'https://firestore.googleapis.com/v1/projects/'+encodeURIComponent(firebaseConfig.projectId)+'/databases/(default)/documents/'+segments.map(encodeURIComponent).join('/');
+async function serverRequest(url,{method='GET',body,timeout=12000}={}){
+ if(!auth?.currentUser)throw Error('인증 미완료: 로그인 상태를 확인하세요');
+ const token=await auth.currentUser.getIdToken();
+ const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeout);
+ try{
+  const res=await fetch(url,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,signal:controller.signal,cache:'no-store'});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok)throw Error('HTTP '+res.status+' '+String(data.error?.message||res.statusText).slice(0,140));
+  return data;
+ }catch(ex){if(ex.name==='AbortError')throw Error('서버 응답 시간 초과(12초): 인터넷 또는 Firebase 연결 확인');throw ex;}
+ finally{clearTimeout(timer);}
+}
+async function serverWriteSettings(settings){
+ const u=new URL(restPath('families',familyId));u.searchParams.append('updateMask.fieldPaths','settings');u.searchParams.append('updateMask.fieldPaths','updatedAt');
+ return serverRequest(u.toString(),{method:'PATCH',body:{fields:{settings:firestoreField(settings),updatedAt:{timestampValue:new Date().toISOString()}}}});
+}
+async function serverWriteRecord(key,value){
+ return serverRequest(restPath('families',familyId,'records',encodeURIComponent(key)),{method:'PATCH',body:{fields:{value:{booleanValue:!!value},updatedAt:{timestampValue:new Date().toISOString()}}}});
+}
+function showSyncHint(message){const el=$('manual-sync-status');if(el)el.textContent=message;}
+
+function backup(){const blob=new Blob([JSON.stringify({version:'2.2',exportedAt:new Date().toISOString(),data:window.eyeBridge.exportBackup()},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='eyedrop-backup-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);status('기록 백업 파일 생성됨');}
 async function init(){if(!CONFIG_OK){status('Firebase 설정 필요');panel();return;}
- const [{initializeApp},{getAuth,onAuthStateChanged,signInAnonymously,createUserWithEmailAndPassword,signInWithEmailAndPassword},{initializeFirestore,persistentLocalCache,persistentMultipleTabManager,doc,getDoc,getDocFromServer,getDocsFromServer,setDoc,updateDoc,collection,writeBatch,onSnapshot,serverTimestamp,disableNetwork,enableNetwork}]=await Promise.all([
+ const [{initializeApp},{getAuth,onAuthStateChanged,signInAnonymously,createUserWithEmailAndPassword,signInWithEmailAndPassword},{initializeFirestore,memoryLocalCache,doc,getDoc,getDocFromServer,getDocsFromServer,setDoc,updateDoc,collection,writeBatch,onSnapshot,serverTimestamp,disableNetwork,enableNetwork}]=await Promise.all([
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js'),
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js'),
  import('https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js')]);
  const app=initializeApp(firebaseConfig);auth=getAuth(app);
- db=initializeFirestore(app,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})});
+ db=initializeFirestore(app,{localCache:memoryLocalCache()});
  api={signInAnonymously,createUserWithEmailAndPassword,signInWithEmailAndPassword,doc,getDoc,getDocFromServer,getDocsFromServer,setDoc,updateDoc,collection,writeBatch,onSnapshot,serverTimestamp,disableNetwork,enableNetwork};
  onAuthStateChanged(auth,u=>{user=u;ready=false;panel();if(!u){status('로그인 또는 기기 연결 필요');return;}
   if(role==='mother'){familyId=u.uid;localStorage.setItem(FAMILY_KEY,familyId);window.eyeBridge.setRole('mother');setupMother().catch(showError);}
@@ -61,7 +95,7 @@ async function init(){if(!CONFIG_OK){status('Firebase 설정 필요');panel();re
  for(const type of ['pageshow','focus','online'])window.addEventListener(type,()=>resume());
  document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume();});
  // A fallback check also recovers from mobile browsers that silently suspend listeners.
- setInterval(()=>{if(!document.hidden&&navigator.onLine&&user&&familyId){if(sendingSince&&Date.now()-sendingSince>12000)recoverNetwork().catch(showError);scheduleSend(0);if(!sendingSince)refreshFromServer().catch(showError);}},8000);
+ setInterval(()=>{if(!document.hidden&&navigator.onLine&&user&&familyId){if(sendingSince&&Date.now()-sendingSince>18000)showSyncHint('응답이 지연됩니다. 재연결 후 다시 시도하세요.');scheduleSend(0);if(!sendingSince)refreshFromServer().catch(showError);}},8000);
  status('Firebase 로그인 복원 중');panel();
 }
 async function setupMother(){if(!user||role!=='mother')return;if(setupPromise)return setupPromise;
@@ -107,28 +141,83 @@ async function migrateRecords(){if(role!=='mother'||!user||!ready)return;if(migr
   if(missing.length)status('기존 기록 '+missing.length+'건 추가 업로드 완료');
  })().finally(()=>migrationPromise=null);return migrationPromise;
 }
-async function flush(){if(!ready||!user||!familyId||!navigator.onLine)return;if(flushPromise){if(sendingSince&&Date.now()-sendingSince>12000)recoverNetwork().catch(showError);return flushPromise;}pendingRecords={...read(PENDING_RECORDS,{}),...pendingRecords};if(role==='parent'&&!pendingSettings)pendingSettings=read(PENDING_SETTINGS,null);
- sendingSince=Date.now();flushPromise=(async()=>{try{
-  if(role==='parent'&&pendingSettings){const value=pendingSettings;
-   await api.updateDoc(api.doc(db,'families',familyId),{settings:value,updatedAt:api.serverTimestamp()});
-   if(pendingSettings===value)pendingSettings=null;persist();}
-  if(role==='mother')for(const [key,value] of Object.entries({...pendingRecords})){
-   await api.setDoc(api.doc(db,'families',familyId,'records',encodeURIComponent(key)),{value,updatedAt:api.serverTimestamp()});
-   if(pendingRecords[key]===value)delete pendingRecords[key];persist();
+async function flush(){
+ if(!ready||!user||!familyId||!navigator.onLine){statusFromSync();return false;}
+ if(flushPromise)return flushPromise;
+ pendingRecords={...read(PENDING_RECORDS,{}),...pendingRecords};
+ if(role==='parent'&&!pendingSettings)pendingSettings=read(PENDING_SETTINGS,null);
+ sendingSince=Date.now();
+ flushPromise=(async()=>{
+  let failed=false;
+  try{
+   if(role==='parent'&&pendingSettings){
+    const value=pendingSettings;
+    await serverWriteSettings(value);
+    if(pendingSettings===value)pendingSettings=null;
+    persist();lastSuccessAt=Date.now();
+   }
+   if(role==='mother')for(const [key,value] of Object.entries({...pendingRecords})){
+    await serverWriteRecord(key,value);
+    if(pendingRecords[key]===value)delete pendingRecords[key];
+    persist();lastSuccessAt=Date.now();
+   }
+   lastError='';statusFromSync();return true;
+  }catch(ex){failed=true;lastError=String(ex?.message||ex).slice(0,155);statusFromSync();showSyncHint('전송 실패: '+lastError);console.error('[eye cloud send]',ex);return false;
+  }finally{
+   sendingSince=0;flushPromise=null;
+   if((Object.keys(pendingRecords).length||pendingSettings)&&navigator.onLine)scheduleSend(failed?12000:1000);
   }
-  lastError='';statusFromSync();
- }catch(ex){lastError=String(ex?.code||ex?.message||ex).slice(0,100);statusFromSync();console.error(ex);scheduleSend(9000);
- }finally{sendingSince=0;flushPromise=null;if((Object.keys(pendingRecords).length||pendingSettings)&&navigator.onLine)scheduleSend(10000);}})();return flushPromise;
+ })();return flushPromise;
 }
-async function refreshFromServer(){if(!ready||!user||!familyId||!navigator.onLine||document.hidden)return;if(refreshPromise)return refreshPromise;
- refreshPromise=(async()=>{try{
-  const family=await api.getDocFromServer(api.doc(db,'families',familyId));
-  if(family.exists()&&family.data().settings&&!pendingSettings)window.eyeBridge.applySettings(family.data().settings);
-  const snap=await api.getDocsFromServer(api.collection(db,'families',familyId,'records'));
-  const records={};snap.docs.forEach(doc=>{try{const key=decodeURIComponent(doc.id);if(!(key in pendingRecords))records[key]=!!doc.data().value;}catch{}});
-  window.eyeBridge.applyDone(records,role==='parent');gotFamily=true;gotRecords=true;lastServerCheck=Date.now();lastError='';statusFromSync();
- }finally{refreshPromise=null;}})();return refreshPromise;
+// Manual sync: send local changes first, then fetch latest from server.
+async function manualSync(){
+ if(manualBusy)return;
+ if(!ready||!user||!familyId){showSyncHint('연결을 확인해 주세요. ☁ 연결 탭에서 로그인/기기 연결 상태를 확인하세요.');return;}
+ if(!navigator.onLine){showSyncHint('인터넷에 연결되지 않았습니다. 기존 체크 기록은 기기에 보관됩니다.');return;}
+ manualBusy=true;showSyncHint('서버에 전송하고 최신 정보를 확인하는 중…');
+ try{
+  const sent=await flush();
+  if(sent===false&&Object.keys(pendingRecords).length+(pendingSettings?1:0)>0){showSyncHint('전송 대기 유지: '+(lastError||'서버 저장을 확인하지 못했습니다.'));return;}
+  await refreshFromServer();
+  const remaining=Object.keys(pendingRecords).length+(pendingSettings?1:0);
+  showSyncHint(remaining?'전송 대기 '+remaining+'건':'동기화 완료 · 서버 확인 '+new Date().toLocaleTimeString('ko-KR'));
+ }catch(ex){showError(ex);showSyncHint('동기화 실패: '+String(ex.message||ex).slice(0,150));}
+ finally{manualBusy=false;statusFromSync();}
 }
+window.eyeCloudManualSync=manualSync;
+
+function firestoreValue(v){
+ if(!v)return null;
+ if('stringValue'in v)return v.stringValue;
+ if('booleanValue'in v)return v.booleanValue;
+ if('integerValue'in v)return Number(v.integerValue);
+ if('doubleValue'in v)return Number(v.doubleValue);
+ if('timestampValue'in v)return v.timestampValue;
+ if('arrayValue'in v)return (v.arrayValue.values||[]).map(firestoreValue);
+ if('mapValue'in v)return Object.fromEntries(Object.entries(v.mapValue.fields||{}).map(([k,x])=>[k,firestoreValue(x)]));
+ return null;
+}
+async function refreshFromServer(){
+ if(!ready||!user||!familyId||!navigator.onLine||document.hidden)return;
+ if(refreshPromise)return refreshPromise;
+ refreshPromise=(async()=>{
+  const family=await serverRequest(restPath('families',familyId));
+  if(family.fields?.settings&&!pendingSettings)window.eyeBridge.applySettings(firestoreValue(family.fields.settings));
+  const records={};let nextToken='';let count=0;
+  do{
+   const url=new URL(restPath('families',familyId,'records'));url.searchParams.set('pageSize','300');
+   if(nextToken)url.searchParams.set('pageToken',nextToken);
+   const page=await serverRequest(url.toString());
+   for(const d of page.documents||[]){
+    try{const raw=d.name.split('/').pop();const key=decodeURIComponent(decodeURIComponent(raw));if(!(key in pendingRecords))records[key]=!!firestoreValue(d.fields?.value);}catch{}
+   }
+   nextToken=page.nextPageToken||'';count++;if(count>30)throw Error('기록 조회량이 많아 확인을 중단했습니다.');
+  }while(nextToken);
+  window.eyeBridge.applyDone(records,role==='parent');
+  gotFamily=true;gotRecords=true;lastServerCheck=Date.now();lastError='';statusFromSync();
+ })().finally(()=>{refreshPromise=null;});return refreshPromise;
+}
+
 function resume(){if(!user||!familyId||!navigator.onLine||document.hidden)return;
  // Re-establish subscriptions when browsers resume after a frozen/backgrounded PWA.
  if(!ready){if(role==='mother')setupMother().catch(showError);else if(role==='parent')subscribe();return;}
