@@ -1,5 +1,5 @@
  'use strict';
-const VERSION='2.2';
+const VERSION='2.3';
 const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
 const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',endDates:{left:'2026-11-11',right:'2026-11-11'},times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{},catalog:null,revisions:[],scheduleSchema:0};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
@@ -82,29 +82,7 @@ function recordRevision(oldConfig){
  else state.revisions.push({at,settings:configSnapshot()});
 }
 
-function convertOldCloudSettings(value){
- if(Number(value.scheduleSchema||0)===21)return value;
- const old=clone(value);
- const draft={...clone(DEFAULT),...old,eyes:{left:{...DEFAULT.eyes.left,...(old.eyes?.left||{})},right:{...DEFAULT.eyes.right,...(old.eyes?.right||{})}},dry:{...DEFAULT.dry,...(old.dry||{})}};
- draft.catalog=migrateToUniformCatalog(draft,dayOf(new Date()));
- draft.scheduleSchema=21;
- draft.revisions=Array.isArray(old.revisions)?clone(old.revisions):[];
- if(!draft.revisions.length){const historic=clone(old);delete historic.done;draft.revisions.push({at:'0000-01-01T00:00:00',settings:historic});}
- const current=clone(draft);delete current.done;delete current.revisions;
- draft.revisions.push({at:stampLocal(),settings:current});
- return draft;
-}
-const syncSettings=()=>{const {done,...settings}=clone(state);return settings;};
-window.eyeBridge={
- getSettings:syncSettings,
- getDone:()=>clone(state.done),
- exportBackup:()=>clone(state),
- applySettings(value){if(!value||!value.eyes)return;const needsMigration=Number(value.scheduleSchema||0)!==21;if(needsMigration)value=convertOldCloudSettings(value);if(JSON.stringify(value)===JSON.stringify(syncSettings()))return;state={...state,...value,eyes:{left:{...DEFAULT.eyes.left,...state.eyes.left,...(value.eyes.left||{})},right:{...DEFAULT.eyes.right,...state.eyes.right,...(value.eyes.right||{})}},dry:{...DEFAULT.dry,...state.dry,...(value.dry||{}),endDates:{...DEFAULT.dry.endDates,...state.dry?.endDates,...value.dry?.endDates}},done:state.done,catalog:normalizeCatalog(value.catalog||state.catalog),revisions:Array.isArray(value.revisions)?value.revisions:state.revisions,scheduleSchema:Number(value.scheduleSchema||state.scheduleSchema||0)};editorCatalog=null;save();if(tab!=='settings')render();else {const note=document.getElementById('draft-notice');if(note)note.textContent='클라우드 설정이 갱신되었습니다. 편집 중인 입력값은 유지되며 저장 시 현재 입력값이 적용됩니다.';}},
- applyDone(value,replace=false){const next=replace?{...value}:{...state.done,...value};if(JSON.stringify(next)===JSON.stringify(state.done))return;state.done=next;save();if(tab!=='settings')render();},
- setRole(role){window.eyeCloudRole=role;render();},
- setStatus(text){window.eyeCloudStatus=text;const el=document.getElementById('cloud-summary');if(el)el.textContent=text;}
-};
-window.eyeCloudRole=localStorage.getItem('eyedrop-cloud-role')||'local';window.eyeCloudStatus='클라우드 연결 전';
+// 로컬 전용: Firebase 연결 및 클라우드 역할/전송 대기열을 사용하지 않습니다.
 let selected=dayOf(new Date()),tab='today';
 const drugNames={A:'A 옵살로신',B:'B 프레드벨',C:'C 브로낙',D:'D 미드린피',E:'디쿠아스에스 (건조증 치료제)'};
 const drugLabel=d=>d.name||drugNames[d.drug]||d.drug;
@@ -287,7 +265,7 @@ function checklist(items){let last='';return items.map((d,i)=>{
  let header='';if(last!==d.time){last=d.time;header=`<div class="timehead">${d.time}</div>`;}
  const boxes=Object.entries(eyeNames).map(([e,name])=>{
   const enabled=eligible(d,e),checked=enabled&&isDone(d,e);
-  return `<label class="eye-check ${enabled?'':'disabled'}"><span class="eye-label">${e==='left'?'왼쪽':'오른쪽'}</span><input type="checkbox" data-index="${i}" data-eye="${e}" aria-label="${drugLabel(d)} ${d.time} ${name} 점안 완료" ${checked?'checked':''} ${enabled&&window.eyeCloudRole!=='parent'?'':'disabled'}></label>`;
+  return `<label class="eye-check ${enabled?'':'disabled'}"><span class="eye-label">${e==='left'?'왼쪽':'오른쪽'}</span><input type="checkbox" data-index="${i}" data-eye="${e}" aria-label="${drugLabel(d)} ${d.time} ${name} 점안 완료" ${checked?'checked':''} ${enabled?'':'disabled'}></label>`;
  }).join('');
  return header+`<div class="dose two-eyes"><span class="letter" style="background:${d.color}">${esc(d.drug.length<=2?d.drug:"약")}</span><span class="details"><strong>${esc(drugLabel(d))}</strong><small>${d.time}${d.drug==='D'?' · 수술 당일':''}</small></span><div class="eye-checks">${boxes}</div></div>`;
  }).join('');}
@@ -311,7 +289,7 @@ function conflictPanel(items,context){
  return `<div class="card"><div class="warn"><strong>점안 간격 확인 필요 · ${hits.length}건</strong><p>${esc(fmt(context))} 일정에서 서로 다른 안약의 간격이 설정한 ${state.gap}분보다 짧습니다. 자동으로 시간을 이동하지 않습니다. 병원 지침을 확인한 뒤 설정에서 시간을 직접 수정하세요.</p>${hits.map(x=>`<div>• ${esc(eyeNames[x.eye])}: ${esc(x.a.time)} ${esc(drugLabel(x.a))} ↔ ${esc(x.b.time)} ${esc(drugLabel(x.b))} (${x.diff}분)</div>`).join('')}</div></div>`;
 }
 function today(){const items=doses(selected),cells=allCells(items),done=cells.filter(({d,e})=>isDone(d,e)).length;
- let html=datebar()+status()+`<div class="card"><button type="button" class="button secondary" id="manual-sync-today" style="margin:0 0 8px">☁ 지금 동기화</button><div id="manual-sync-status" class="note" aria-live="polite">전송 대기는 ☁ 연결에서 확인할 수 있어요.</div></div><div class="card"><div class="section-title">점안 현황</div><div class="stat">${done} / ${cells.length}회 완료</div><div class="track"><div class="fill" style="width:${cells.length?done/cells.length*100:0}%"></div></div><div class="note">왼쪽·오른쪽 눈을 각각 체크하세요. 회색 체크박스는 해당 눈의 점안 대상이 아닙니다.</div></div>`;
+ let html=datebar()+status()+`<div class="card"><div class="section-title">점안 현황</div><div class="stat">${done} / ${cells.length}회 완료</div><div class="track"><div class="fill" style="width:${cells.length?done/cells.length*100:0}%"></div></div><div class="note">왼쪽·오른쪽 눈을 각각 체크하세요. 회색 체크박스는 해당 눈의 점안 대상이 아닙니다.</div></div>`;
  html+=conflictPanel(items,selected);
  return html+(items.length?checklist(items):'<div class="card empty">이 날짜에 표시할 안약 일정이 없습니다.</div>');
 }
@@ -350,9 +328,18 @@ function settings(){if(!editorCatalog)editorCatalog=normalizeCatalog(state.catal
  ${Object.entries(eyeNames).map(([e,name])=>`<div class="eye-settings"><strong>${name}</strong><div class="field"><label for="${e}-visit">수술 일시</label><input type="datetime-local" id="${e}-visit" value="${esc(state.eyes[e].visit)}" required></div><div class="field"><label for="${e}-completedAt">수술 완료 일시 (선택)</label><input type="datetime-local" id="${e}-completedAt" value="${state.eyes[e].completed?esc(state.eyes[e].completedAt):''}"></div></div>`).join('')}
  </div><div class="card"><div class="section-title">전체 안약의 최소 점안 간격</div><div class="field"><label for="global-gap">최소 간격 (5~10분)</label><input type="number" id="global-gap" min="5" max="10" step="1" value="${state.gap}" required></div><p class="note">같은 눈의 서로 다른 안약이 설정 간격보다 가까우면 경고합니다. 시간을 자동으로 옮기지 않습니다.</p><p class="note">설정을 저장하는 순간 이후의 일정에만 새 처방을 반영하며, 이전 체크 기록과 이전 설정은 보존합니다.</p><button type="submit" class="button">설정 저장</button></div></form>`;
 }
-function syncPage(){return `<div class="card"><div class="section-title">클라우드 동기화 <span class="version">v2.1</span></div><p class="note">어머니 휴대폰은 기록 입력, 보호자 아이폰은 기록 보기와 설정 수정이 가능합니다. 현재 연결 상태: <strong id="cloud-summary">${esc(window.eyeCloudStatus||'연결 전')}</strong></p><p class="note">기존 기록은 이 기기에 그대로 저장됩니다. 최초 연결 또는 재시도 시 누락된 기록을 확인해 전송합니다.</p><div id="sync-ui"><div class="note">연결 기능을 불러오는 중입니다.</div></div></div>`;}
-function render(){if(window.eyeCloudRole==='mother'&&tab==='settings')tab='today';const settingsTab=document.querySelector('[data-tab="settings"]');if(settingsTab)settingsTab.hidden=window.eyeCloudRole==='mother';document.querySelector('#version').textContent='v'+VERSION;document.querySelector('#title').textContent=tab==='today'?'오늘의 안약':tab==='settings'?'일정 설정':'클라우드 연결';document.querySelector('#subtitle').textContent=tab==='settings'?'눈별 날짜와 수술 일정을 설정해요':tab==='sync'?'기기 연결 및 동기화 상태를 확인해요':'왼쪽·오른쪽 눈을 각각 체크해요';document.querySelector('#content').innerHTML=tab==='today'?today():tab==='settings'?settings():syncPage();document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));if(tab==='sync')window.dispatchEvent(new Event('eye-sync-panel'));}
-document.addEventListener('click',e=>{if(e.target.closest('#manual-sync-today')){if(window.eyeCloudManualSync)window.eyeCloudManualSync();else {const el=document.getElementById('manual-sync-status');if(el)el.textContent='클라우드 기능 초기화 중입니다. 잠시 후 다시 시도하세요.';}return;}const b=e.target.closest('[data-tab]');if(b){if(b.dataset.tab==='settings'&&window.eyeCloudRole==='mother')return;tab=b.dataset.tab==='history'?'today':b.dataset.tab;render();return;}if(e.target.id==='go-today'){selected=dayOf(new Date());render();}});
+function render(){
+ document.querySelector('#version').textContent='v'+VERSION;
+ document.querySelector('#title').textContent=tab==='today'?'오늘의 안약':'일정 설정';
+ document.querySelector('#subtitle').textContent=tab==='settings'?'안약별 · 눈별 점안 시간을 설정해요':'왼쪽·오른쪽 눈을 각각 체크해요';
+ document.querySelector('#content').innerHTML=tab==='today'?today():settings();
+ document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+}
+document.addEventListener('click',e=>{
+ const b=e.target.closest('[data-tab]');
+ if(b){tab=b.dataset.tab;editorCatalog=null;render();return;}
+ if(e.target.id==='go-today'){selected=dayOf(new Date());render();}
+});
 function refreshCount(group){if(!group)return;const count=document.querySelector(`[data-count="${group.dataset.times}"]`);if(count)count.textContent=group.querySelectorAll('input[type="time"]').length+'회/일';}
 function saveFormDraft(){return [...document.querySelectorAll('#settings-form input[id]')].map(el=>({id:el.id,checked:el.checked,value:el.value,type:el.type}));}
 function restoreFormDraft(draft){for(const x of draft){const input=document.getElementById(x.id);if(input){if(x.type==='checkbox')input.checked=x.checked;else input.value=x.value;}}}
@@ -363,8 +350,17 @@ document.addEventListener('click',e=>{
  const add=e.target.closest('[data-add]');if(add){const group=document.querySelector(`[data-times="${add.dataset.add}"]`);group?.insertAdjacentHTML('beforeend',timeRow('12:00'));refreshCount(group);return;}
  const del=e.target.closest('.remove-time');if(del){const group=del.closest('.times-editor');del.closest('.medicine-time')?.remove();refreshCount(group);return;}
 });
-document.addEventListener('change',e=>{if(e.target.id==='day'){selected=e.target.value;render();}if(e.target.matches('input[data-index][data-eye]')){const d=doses(selected)[Number(e.target.dataset.index)],eye=e.target.dataset.eye;if(d&&eligible(d,eye)&&window.eyeCloudRole!=='parent'){const k=doseKey(d,eye);state.done[k]=e.target.checked;save();if(window.eyeCloudRole==='mother'){const qk='eyedrop-cloud-pending-records-v18';try{const q=JSON.parse(localStorage.getItem(qk)||'{}');q[k]=e.target.checked;localStorage.setItem(qk,JSON.stringify(q));}catch{}}window.dispatchEvent(new CustomEvent('eye-record-change',{detail:{key:k,value:e.target.checked}}));render();}}});
-document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();if(window.eyeCloudRole==='mother'){alert('어머니 기기에서는 설정을 변경할 수 없습니다.');return;}
+document.addEventListener('change',e=>{
+ if(e.target.id==='day'){selected=e.target.value;render();}
+ if(e.target.matches('input[data-index][data-eye]')){
+  const d=doses(selected)[Number(e.target.dataset.index)],eye=e.target.dataset.eye;
+  if(d&&eligible(d,eye)){
+   state.done[doseKey(d,eye)]=e.target.checked;
+   save();render();
+  }
+ }
+});
+document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e.preventDefault();
  const nextCatalog=readEditor();if(nextCatalog.some(d=>!d.name.trim())){alert('안약 이름을 입력해 주세요.');return;}
  const eyes=clone(state.eyes);
  for(const eye of Object.keys(eyeNames)){
@@ -377,7 +373,7 @@ document.addEventListener('submit',e=>{if(e.target.id!=='settings-form')return;e
  const gap=Number(document.getElementById('global-gap').value);
  if(!Number.isInteger(gap)||gap<5||gap>10){alert('최소 점안 간격은 5~10분 사이의 정수여야 합니다.');return;}
  const oldConfig=configSnapshot();state.catalog=nextCatalog;state.eyes=eyes;state.gap=gap;state.scheduleSchema=21;
- recordRevision(oldConfig);save();if(window.eyeCloudRole==='parent')localStorage.setItem('eyedrop-cloud-pending-settings-v18',JSON.stringify(syncSettings()));editorCatalog=null;
- window.dispatchEvent(new CustomEvent('eye-settings-change',{detail:{settings:syncSettings()}}));alert('설정이 저장되었습니다. 이전 일정과 기록은 그대로 유지됩니다.');render();
+ recordRevision(oldConfig);save();editorCatalog=null;
+ alert('설정이 저장되었습니다. 이전 일정과 기록은 그대로 유지됩니다.');render();
 });
 render();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{});
