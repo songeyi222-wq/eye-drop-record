@@ -1,6 +1,6 @@
 {
-  "revisionId": "20261112_0930_v2",
-  "effectiveAt": "2026-11-12T09:30:00",
+  "revisionId": "20261112_0900_correction_v3",
+  "effectiveAt": "2026-11-12T09:00:00",
   "minGapMinutes": 10,
   "medicines": [
     {
@@ -96,5 +96,6 @@
         ]
       }
     }
-  ]
+  ],
+  "supersedesRevisionId": "20261112_0930_v2"
 }

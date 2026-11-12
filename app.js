@@ -1,5 +1,5 @@
  'use strict';
-const VERSION='2.4';
+const VERSION='2.4.1';
 const KEY='eyedrop-record-pwa-v06',OLD='eyedrop-record-pwa-v05'; // 기존 기록 유지
 const DEFAULT={eyes:{left:{start:'2026-11-07',visit:'2026-11-10T08:00',enabled:true,completed:false,completedAt:'2026-11-10T10:00',restart:'12:00',hourlyUntil:'18:00'},right:{start:'2026-11-07',visit:'2026-11-11T11:00',enabled:true,completed:false,completedAt:'2026-11-11T13:00',restart:'15:00',hourlyUntil:'18:00'}},sessions:'07:00,12:00,17:00,21:00',dLeadHours:1,gap:10,drugSessions:{A:[0,1,2,3],B:[0,1,2,3],C:[0,3]},dry:{start:'2026-10-14',endDates:{left:'2026-11-11',right:'2026-11-11'},times:['07:30','10:00','12:30','15:00','17:30','20:00'],gap:10,enabled:true},done:{},catalog:null,revisions:[],scheduleSchema:0,remoteSchedule:null};
 const clone=x=>JSON.parse(JSON.stringify(x)),pad=n=>String(n).padStart(2,'0'),dayOf=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
@@ -329,10 +329,10 @@ async function checkRemoteSchedule(){
   if(!response.ok)throw new Error('HTTP '+response.status);
   const payload=await response.json(),cfg=remoteConfiguration(payload);
   const oldRemote=state.remoteSchedule;
-  if(oldRemote && payload.effectiveAt<oldRemote.effectiveAt && payload.revisionId!==oldRemote.revisionId)throw new Error('기존보다 오래된 스케줄입니다');
+  if(oldRemote && payload.effectiveAt<oldRemote.effectiveAt && payload.revisionId!==oldRemote.revisionId && payload.supersedesRevisionId!==oldRemote.revisionId)throw new Error('기존보다 오래된 스케줄입니다');
   if(!oldRemote||oldRemote.revisionId!==payload.revisionId){
    // 기존 과거 설정과 완료 체크는 그대로 두고 적용시각 이후의 일정만 변경합니다.
-   // 이후 수정본을 배포할 때는 새 revisionId와 더 늦은 effectiveAt을 사용합니다.
+   // 수정 적용시각을 앞당기는 정정본은 supersedesRevisionId로 기존 버전을 명시합니다.
    const snapshot=configSnapshot();
    const revs=(state.revisions||[]).filter(r=>r.at<payload.effectiveAt);
    if(!revs.length)revs.push({at:'0000-01-01T00:00:00',settings:snapshot});
